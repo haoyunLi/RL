@@ -1,0 +1,38 @@
+# Core scientific computing libraries
+numpy>=1.21.0,<2.0
+pandas>=1.3.0,<2.4
+scipy>=1.8,<1.17
+# Streamlit requires packaging <25
+packaging<25
+
+# Image processing
+Pillow>=10.4.0
+# Using headless version for server environments
+opencv-python-headless>=4.9.0,<4.12
+# Latest stable release as of this environment is 0.24.0
+scikit-image>=0.24.0,<0.26
+
+# Segmentation (StarDist)
+stardist==0.9.1
+tensorflow>=2.13.0
+csbdeep>=0.8.0
+
+# Visualization
+matplotlib>=3.4.0
+
+# Jupyter notebook support
+jupyter>=1.0.0
+ipykernel>=6.0.0
+
+# High-performance computing
+numba>=0.57.0
+
+# Data processing
+fastparquet>=0.8.0
+
+# Cell type annotation
+celltypist>=1.7.0
+# Latest released version on PyPI is 1.10.3
+scanpy>=1.10.3,<1.12
+# Updated to match installed version 0.5.1
+scikit-misc>=0.5.0,<0.6

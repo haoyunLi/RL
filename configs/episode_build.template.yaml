@@ -1,0 +1,44 @@
+run:
+  # Free-form run name; output folder becomes: <output_root>/<name>_<UTC timestamp>
+  name: human_colorectal_episode_build
+  output_root: runs
+  # Seed is used for any optional row sampling (debug limits).
+  seed: 42
+
+inputs:
+  # Replace these with your real generated table paths.
+  # Keep Human_Colorectal/ as raw input data only; write generated tables to workspace_outputs/.
+  nuclei_path: workspace_outputs/human_colorectal/intermediate/nuclei_table.csv
+  bins_path: workspace_outputs/human_colorectal/intermediate/bin_expression_table.csv
+
+  # One of: auto, csv, tsv, parquet
+  nuclei_format: auto
+  bins_format: auto
+
+  nuclei_columns:
+    cell_id: cell_id
+    center_x_um: center_x_um
+    center_y_um: center_y_um
+    radius_um: radius_um
+    # Set to null if not available yet.
+    cell_type: null
+
+  bin_columns:
+    bin_id: bin_id
+    x_um: x_um
+    y_um: y_um
+
+  expression:
+    # mode=prefix: take all columns starting with `prefix`
+    # mode=list: use exactly `columns`
+    mode: prefix
+    prefix: expr_
+    columns: []
+
+environment:
+  max_center_distance_um: 80.0
+  radius_band_um: 80.0
+  strict_action_validation: true
+  # null means resolve automatically from number of candidate bins.
+  max_steps: null
+  default_steps_multiplier: 3

@@ -1,0 +1,25 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Experiment and run artifacts
+runs/
+jobs/
+tmp_episode_build_test/
+workspace_outputs/
+
+# Local conda/venv-style environments in repo
+cellpose/
+Bin2Cell_Validation/
+
+# Scheduler and log outputs
+*.out
+*.err
+*.log
+*.sbatch
+
+# Local input/test data
+Human_Colorectal/
