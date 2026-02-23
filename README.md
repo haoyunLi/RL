@@ -11,7 +11,7 @@ This repository now includes a production-style starter framework to model **one
 - State fields required now:
   - `membership_mask` (`0/1`, per candidate bin)
   - `belonged_bin_ids`
-  - `processed_mask` (your `f` state)
+  - `processed_mask` (`f` state)
   - `candidate_expression`
   - `candidate_bin_xy_um`
   - `nucleus_center_xy_um`, `nucleus_radius_um`
@@ -79,13 +79,6 @@ Build episodes from config:
 python scripts/run_episode_build.py --config configs/episode_build.template.yaml
 ```
 
-## Integration Notes
-
-- **Your question: should each cell be one environment?**
-  - In this scaffold: yes, one nucleus corresponds to one episode/environment instance.
-- **Cell type**
-  - Included as optional field now (`cell_type=None` by default). You can fill this later when annotation pipeline is ready.
-
 ## State Snapshot Usage
 
 Use explicit state object from the environment:
@@ -135,4 +128,3 @@ Each runner execution creates a new run folder like `runs/<run_name>_<UTC timest
 - `states/*.npz`: per-cell state snapshots (nucleus info + candidate bins + expression)
 - `summary.json`: aggregate statistics (episode counts, empty episodes, bin stats)
 - `episodes_index.csv`: per-episode table and artifact file paths
-# RL
