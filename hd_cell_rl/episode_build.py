@@ -12,13 +12,16 @@ import subprocess
 import sys
 from typing import Any
 
+import h5py
 import numpy as np
 import pandas as pd
+from scipy import sparse
+from scipy.spatial import cKDTree
 import yaml
 
 from .builder import build_episodes
 from .config import EnvironmentConfig
-from .models import BinRecord, NucleusRecord
+from .models import BinRecord, CellEpisodeData, NucleusRecord
 
 
 class ConfigError(ValueError):
@@ -41,6 +44,11 @@ class EpisodeBuildConfig:
     expression_mode: str
     expression_prefix: str | None
     expression_columns: tuple[str, ...]
+    expression_matrix_h5_path: Path | None
+    expression_matrix_col_index_column: str
+    expression_reference_npz_path: Path | None
+    expression_reference_genes_key: str
+    expression_max_genes: int | None
     env_config: EnvironmentConfig
 
     def to_serializable_dict(self) -> dict[str, Any]:
@@ -62,6 +70,11 @@ class EpisodeBuildConfig:
                     "mode": self.expression_mode,
                     "prefix": self.expression_prefix,
                     "columns": list(self.expression_columns),
+                    "matrix_h5_path": None if self.expression_matrix_h5_path is None else str(self.expression_matrix_h5_path),
+                    "matrix_col_index_column": self.expression_matrix_col_index_column,
+                    "reference_npz_path": None if self.expression_reference_npz_path is None else str(self.expression_reference_npz_path),
+                    "reference_genes_key": self.expression_reference_genes_key,
+                    "max_genes": self.expression_max_genes,
                 },
             },
             "environment": {
@@ -112,6 +125,11 @@ def load_episode_build_config(config_path: str | Path) -> EpisodeBuildConfig:
     expression_mode = str(expression_cfg.get("mode", "prefix"))
     expression_prefix = expression_cfg.get("prefix")
     expression_columns_raw = expression_cfg.get("columns", [])
+    expression_matrix_h5_path_raw = expression_cfg.get("matrix_h5_path")
+    expression_matrix_col_index_column = str(expression_cfg.get("matrix_col_index_column", "matrix_col_index"))
+    expression_reference_npz_path_raw = expression_cfg.get("reference_npz_path")
+    expression_reference_genes_key = str(expression_cfg.get("reference_genes_key", "genes"))
+    expression_max_genes_raw = expression_cfg.get("max_genes", None)
 
     if expression_columns_raw is None:
         expression_columns_raw = []
@@ -119,14 +137,33 @@ def load_episode_build_config(config_path: str | Path) -> EpisodeBuildConfig:
         raise ConfigError("inputs.expression.columns must be a list")
 
     expression_columns = tuple(str(col) for col in expression_columns_raw)
+    expression_matrix_h5_path = (
+        None
+        if expression_matrix_h5_path_raw is None
+        else Path(str(expression_matrix_h5_path_raw)).expanduser().resolve()
+    )
+    expression_reference_npz_path = (
+        None
+        if expression_reference_npz_path_raw is None
+        else Path(str(expression_reference_npz_path_raw)).expanduser().resolve()
+    )
+    expression_max_genes = None if expression_max_genes_raw is None else int(expression_max_genes_raw)
 
-    if expression_mode not in {"prefix", "list"}:
-        raise ConfigError("inputs.expression.mode must be 'prefix' or 'list'")
+    if expression_mode not in {"prefix", "list", "matrix_h5"}:
+        raise ConfigError("inputs.expression.mode must be 'prefix', 'list', or 'matrix_h5'")
 
     if expression_mode == "prefix":
         if expression_prefix is None or not str(expression_prefix):
             raise ConfigError("inputs.expression.prefix must be set when mode='prefix'")
         expression_prefix = str(expression_prefix)
+    elif expression_mode == "matrix_h5":
+        expression_prefix = None
+        if expression_matrix_h5_path is None:
+            raise ConfigError("inputs.expression.matrix_h5_path must be set when mode='matrix_h5'")
+        if not expression_matrix_col_index_column:
+            raise ConfigError("inputs.expression.matrix_col_index_column must be non-empty when mode='matrix_h5'")
+        if expression_max_genes is not None and expression_max_genes <= 0:
+            raise ConfigError("inputs.expression.max_genes must be > 0 when provided")
 
     max_center_distance_um = float(environment.get("max_center_distance_um", 80.0))
     radius_band_um_raw = environment.get("radius_band_um", 80.0)
@@ -160,6 +197,11 @@ def load_episode_build_config(config_path: str | Path) -> EpisodeBuildConfig:
         expression_mode=expression_mode,
         expression_prefix=expression_prefix,
         expression_columns=expression_columns,
+        expression_matrix_h5_path=expression_matrix_h5_path,
+        expression_matrix_col_index_column=expression_matrix_col_index_column,
+        expression_reference_npz_path=expression_reference_npz_path,
+        expression_reference_genes_key=expression_reference_genes_key,
+        expression_max_genes=expression_max_genes,
         env_config=env_config,
     )
 
@@ -216,36 +258,53 @@ def run_episode_build(
             payload={"limit_bins": int(limit_bins), "n_bins_after_limit": int(len(bins_df))},
         )
 
-    expression_columns = _resolve_expression_columns(
-        bins_df=bins_df,
-        mode=config.expression_mode,
-        prefix=config.expression_prefix,
-        configured_columns=config.expression_columns,
-    )
-    _append_step_log(
-        steps_log_path,
-        event="expression_columns_resolved",
-        payload={"expression_dim": int(len(expression_columns))},
-    )
-
     _validate_nuclei_schema(nuclei_df, config.nuclei_columns)
-    _validate_bins_schema(bins_df, config.bin_columns, expression_columns)
+    _validate_bins_schema_common(bins_df, config.bin_columns)
     _append_step_log(steps_log_path, event="schema_validated", payload={})
 
     nuclei_records = _build_nucleus_records(nuclei_df, config.nuclei_columns)
-    bin_records = _build_bin_records(bins_df, config.bin_columns, expression_columns)
-    _append_step_log(
-        steps_log_path,
-        event="records_built",
-        payload={"n_nucleus_records": int(len(nuclei_records)), "n_bin_records": int(len(bin_records))},
-    )
+    if config.expression_mode == "matrix_h5":
+        episodes, expression_dim = _build_episodes_matrix_backed(
+            nuclei_records=nuclei_records,
+            bins_df=bins_df,
+            bin_columns=config.bin_columns,
+            env_config=config.env_config,
+            matrix_h5_path=config.expression_matrix_h5_path,
+            matrix_col_index_column=config.expression_matrix_col_index_column,
+            reference_npz_path=config.expression_reference_npz_path,
+            reference_genes_key=config.expression_reference_genes_key,
+            max_genes=config.expression_max_genes,
+            steps_log_path=steps_log_path,
+        )
+        resolved_expression_columns = ("__matrix_h5__",)
+    else:
+        expression_columns = _resolve_expression_columns(
+            bins_df=bins_df,
+            mode=config.expression_mode,
+            prefix=config.expression_prefix,
+            configured_columns=config.expression_columns,
+        )
+        _append_step_log(
+            steps_log_path,
+            event="expression_columns_resolved",
+            payload={"expression_dim": int(len(expression_columns))},
+        )
+        _validate_bins_expression_columns(bins_df, expression_columns)
+        bin_records = _build_bin_records(bins_df, config.bin_columns, expression_columns)
+        _append_step_log(
+            steps_log_path,
+            event="records_built",
+            payload={"n_nucleus_records": int(len(nuclei_records)), "n_bin_records": int(len(bin_records))},
+        )
 
-    episodes = build_episodes(nuclei=nuclei_records, bins=bin_records, config=config.env_config)
-    _append_step_log(
-        steps_log_path,
-        event="episodes_built",
-        payload={"n_episodes": int(len(episodes))},
-    )
+        episodes = build_episodes(nuclei=nuclei_records, bins=bin_records, config=config.env_config)
+        _append_step_log(
+            steps_log_path,
+            event="episodes_built",
+            payload={"n_episodes": int(len(episodes))},
+        )
+        expression_dim = len(expression_columns)
+        resolved_expression_columns = expression_columns
 
     episode_index = _save_episode_artifacts(
         episodes=episodes,
@@ -255,11 +314,11 @@ def run_episode_build(
     summary = _compute_summary(
         n_input_nuclei=len(nuclei_df),
         n_input_bins=len(bins_df),
-        expression_dim=len(expression_columns),
+        expression_dim=expression_dim,
         episode_index=episode_index,
     )
 
-    _write_yaml(config_dir / "config_resolved.yaml", _merge_config_with_resolved_columns(config, expression_columns))
+    _write_yaml(config_dir / "config_resolved.yaml", _merge_config_with_resolved_columns(config, resolved_expression_columns))
     _write_json(config_dir / "metadata.json", _build_metadata(config=config, run_dir=run_dir))
     _write_json(run_dir / "summary.json", summary)
     pd.DataFrame(episode_index).to_csv(run_dir / "episodes_index.csv", index=False)
@@ -435,8 +494,8 @@ def _validate_nuclei_schema(df: pd.DataFrame, columns: dict[str, str | None]) ->
             raise ValueError(f"nuclei cell_type column {cell_type_col!r} is not present")
 
 
-def _validate_bins_schema(df: pd.DataFrame, columns: dict[str, str], expression_columns: tuple[str, ...]) -> None:
-    required = [columns["bin_id"], columns["x_um"], columns["y_um"], *expression_columns]
+def _validate_bins_schema_common(df: pd.DataFrame, columns: dict[str, str]) -> None:
+    required = [columns["bin_id"], columns["x_um"], columns["y_um"]]
     _require_columns(df, required, table_name="bins")
 
     bin_id_col = columns["bin_id"]
@@ -450,7 +509,10 @@ def _validate_bins_schema(df: pd.DataFrame, columns: dict[str, str], expression_
     for key in ("x_um", "y_um"):
         _validate_numeric_series(df[columns[key]], f"bins.{columns[key]}")
 
+def _validate_bins_expression_columns(df: pd.DataFrame, expression_columns: tuple[str, ...]) -> None:
     for expr_col in expression_columns:
+        if expr_col not in df.columns:
+            raise ValueError(f"expression column missing in bins table: {expr_col!r}")
         _validate_numeric_series(df[expr_col], f"bins.{expr_col}")
 
 
@@ -537,6 +599,197 @@ def _build_bin_records(
         )
 
     return records
+
+
+def _build_episodes_matrix_backed(
+    nuclei_records: list[NucleusRecord],
+    bins_df: pd.DataFrame,
+    bin_columns: dict[str, str],
+    env_config: EnvironmentConfig,
+    matrix_h5_path: Path | None,
+    matrix_col_index_column: str,
+    reference_npz_path: Path | None,
+    reference_genes_key: str,
+    max_genes: int | None,
+    steps_log_path: Path,
+) -> tuple[list[CellEpisodeData], int]:
+    """Build episodes by loading expression vectors from 10x H5 via matrix_col_index."""
+    if matrix_h5_path is None:
+        raise ConfigError("matrix_h5_path must be set for matrix_h5 expression mode")
+    if not matrix_h5_path.exists():
+        raise FileNotFoundError(f"matrix H5 file not found: {matrix_h5_path}")
+    if matrix_col_index_column not in bins_df.columns:
+        raise ValueError(
+            f"bins table missing matrix col index column {matrix_col_index_column!r} "
+            f"required for matrix_h5 mode"
+        )
+
+    bin_ids = bins_df[bin_columns["bin_id"]].astype(str).to_numpy()
+    x_um = pd.to_numeric(bins_df[bin_columns["x_um"]], errors="raise").to_numpy(dtype=np.float32)
+    y_um = pd.to_numeric(bins_df[bin_columns["y_um"]], errors="raise").to_numpy(dtype=np.float32)
+    matrix_col_index = pd.to_numeric(bins_df[matrix_col_index_column], errors="raise").to_numpy(dtype=np.int64)
+
+    if (matrix_col_index < 0).any():
+        raise ValueError(f"column bins.{matrix_col_index_column} must be >= 0")
+
+    x_csc, feature_names = _load_10x_csc_and_feature_names(matrix_h5_path)
+    n_features, n_cols = x_csc.shape
+    if (matrix_col_index >= n_cols).any():
+        bad = int(matrix_col_index[matrix_col_index >= n_cols][0])
+        raise ValueError(
+            f"bins.{matrix_col_index_column} contains index {bad} outside matrix column range [0, {n_cols})"
+        )
+
+    selected_feature_indices = _resolve_matrix_feature_indices(
+        feature_names=feature_names,
+        reference_npz_path=reference_npz_path,
+        reference_genes_key=reference_genes_key,
+        max_genes=max_genes,
+    )
+    if selected_feature_indices.size == 0:
+        raise ValueError("matrix_h5 mode selected zero genes")
+    if selected_feature_indices.max() >= n_features:
+        raise ValueError("selected feature index exceeds matrix row count")
+
+    x_selected = x_csc[selected_feature_indices, :].astype(np.float32)
+    _append_step_log(
+        steps_log_path,
+        event="expression_columns_resolved",
+        payload={
+            "expression_dim": int(selected_feature_indices.size),
+            "matrix_h5_path": str(matrix_h5_path),
+            "n_matrix_features": int(n_features),
+            "n_matrix_barcodes": int(n_cols),
+        },
+    )
+
+    xy = np.column_stack((x_um, y_um)).astype(np.float64, copy=False)
+    tree = cKDTree(xy) if len(xy) else None
+
+    episodes: list[CellEpisodeData] = []
+    for nucleus in nuclei_records:
+        if tree is None:
+            episodes.append(CellEpisodeData(nucleus=nucleus, candidate_bins=()))
+            continue
+
+        candidate_idx = np.asarray(
+            tree.query_ball_point(
+                [float(nucleus.center_x_um), float(nucleus.center_y_um)],
+                r=float(env_config.max_center_distance_um),
+            ),
+            dtype=np.int64,
+        )
+        if candidate_idx.size == 0:
+            episodes.append(CellEpisodeData(nucleus=nucleus, candidate_bins=()))
+            continue
+
+        dx = x_um[candidate_idx].astype(np.float64, copy=False) - float(nucleus.center_x_um)
+        dy = y_um[candidate_idx].astype(np.float64, copy=False) - float(nucleus.center_y_um)
+        dist = np.sqrt(dx * dx + dy * dy)
+        keep = dist <= float(env_config.max_center_distance_um)
+
+        if env_config.radius_band_um is not None:
+            keep &= np.abs(float(nucleus.radius_um) - dist) <= float(env_config.radius_band_um)
+
+        candidate_idx = candidate_idx[keep]
+        if candidate_idx.size == 0:
+            episodes.append(CellEpisodeData(nucleus=nucleus, candidate_bins=()))
+            continue
+
+        candidate_idx.sort()
+        candidate_cols = matrix_col_index[candidate_idx]
+        candidate_expr = x_selected[:, candidate_cols].toarray().T.astype(np.float32, copy=False)
+
+        candidate_bins: list[BinRecord] = []
+        for j in range(candidate_idx.size):
+            i = int(candidate_idx[j])
+            candidate_bins.append(
+                BinRecord(
+                    bin_id=str(bin_ids[i]),
+                    x_um=float(x_um[i]),
+                    y_um=float(y_um[i]),
+                    expression=candidate_expr[j],
+                )
+            )
+        episodes.append(CellEpisodeData(nucleus=nucleus, candidate_bins=tuple(candidate_bins)))
+
+    _append_step_log(
+        steps_log_path,
+        event="records_built",
+        payload={"n_nucleus_records": int(len(nuclei_records)), "n_bin_records": int(len(bin_ids))},
+    )
+    _append_step_log(
+        steps_log_path,
+        event="episodes_built",
+        payload={"n_episodes": int(len(episodes))},
+    )
+    return episodes, int(selected_feature_indices.size)
+
+
+def _load_10x_csc_and_feature_names(matrix_h5_path: Path) -> tuple[sparse.csc_matrix, np.ndarray]:
+    """Load 10x matrix as CSC plus feature-name vector from H5."""
+    with h5py.File(matrix_h5_path, "r") as h5:
+        if "matrix" not in h5:
+            raise ValueError(f"H5 file does not contain 'matrix' group: {matrix_h5_path}")
+        mg = h5["matrix"]
+        required = ["data", "indices", "indptr", "shape", "features"]
+        missing = [k for k in required if k not in mg]
+        if missing:
+            raise ValueError(f"H5 matrix group missing keys: {missing}")
+        fg = mg["features"]
+        if "name" not in fg:
+            raise ValueError("H5 matrix/features missing 'name' dataset")
+
+        data = mg["data"][:]
+        indices = mg["indices"][:]
+        indptr = mg["indptr"][:]
+        shape = tuple(int(v) for v in mg["shape"][:].tolist())
+        feature_names = np.asarray([x.decode("utf-8") for x in fg["name"][:]], dtype="U")
+
+    x_csc = sparse.csc_matrix((data, indices, indptr), shape=shape, dtype=np.float32)
+    if x_csc.shape[0] != feature_names.size:
+        raise ValueError("feature count mismatch between H5 matrix rows and feature names")
+    return x_csc, feature_names
+
+
+def _resolve_matrix_feature_indices(
+    feature_names: np.ndarray,
+    reference_npz_path: Path | None,
+    reference_genes_key: str,
+    max_genes: int | None,
+) -> np.ndarray:
+    """Resolve matrix row indices (genes) for expression extraction."""
+    if reference_npz_path is None:
+        indices = np.arange(feature_names.size, dtype=np.int64)
+    else:
+        if not reference_npz_path.exists():
+            raise FileNotFoundError(f"reference NPZ file not found: {reference_npz_path}")
+        with np.load(reference_npz_path) as data:
+            if reference_genes_key not in data:
+                raise ConfigError(
+                    f"inputs.expression.reference_genes_key {reference_genes_key!r} "
+                    f"is not present in {reference_npz_path}"
+                )
+            ordered_genes = data[reference_genes_key].astype(str)
+
+        first_index_by_name: dict[str, int] = {}
+        for i, name in enumerate(feature_names.astype(str)):
+            if name not in first_index_by_name:
+                first_index_by_name[name] = i
+
+        missing = [g for g in ordered_genes if g not in first_index_by_name]
+        if missing:
+            preview = missing[:5]
+            raise ValueError(
+                f"{len(missing)} reference genes are missing in matrix features; "
+                f"first missing: {preview}"
+            )
+
+        indices = np.asarray([first_index_by_name[g] for g in ordered_genes], dtype=np.int64)
+
+    if max_genes is not None and indices.size > max_genes:
+        indices = indices[: int(max_genes)]
+    return indices
 
 
 def _save_episode_artifacts(

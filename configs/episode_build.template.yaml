@@ -6,10 +6,9 @@ run:
   seed: 42
 
 inputs:
-  # Replace these with your real generated table paths.
-  # Keep Human_Colorectal/ as raw input data only; write generated tables to workspace_outputs/.
-  nuclei_path: workspace_outputs/human_colorectal/intermediate/nuclei_table.csv
-  bins_path: workspace_outputs/human_colorectal/intermediate/bin_expression_table.csv
+  # Current generated paths in this workspace.
+  nuclei_path: workspace_outputs/human_colorectal/intermediate/human_colorectal_nuclei.parquet
+  bins_path: workspace_outputs/human_colorectal/intermediate/square_002um_nuclear/human_colorectal_square_002um_rl.metadata.parquet
 
   # One of: auto, csv, tsv, parquet
   nuclei_format: auto
@@ -29,11 +28,16 @@ inputs:
     y_um: y_um
 
   expression:
-    # mode=prefix: take all columns starting with `prefix`
-    # mode=list: use exactly `columns`
-    mode: prefix
-    prefix: expr_
+    # Real expression mode: load from 10x H5 via bins.matrix_col_index.
+    # Gene order is taken from the aligned reference NPZ so reward dims match.
+    mode: matrix_h5
+    prefix: null
     columns: []
+    matrix_h5_path: Human_Colorectal/output/binned_outputs/square_002um/raw_feature_bc_matrix.h5
+    matrix_col_index_column: matrix_col_index
+    reference_npz_path: workspace_outputs/human_colorectal/intermediate/reference_sct/reference_counts_sct_tumor_aligned_hd_overlap_unique.npz
+    reference_genes_key: genes
+    max_genes: null
 
 environment:
   max_center_distance_um: 80.0

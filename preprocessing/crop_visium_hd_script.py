@@ -37,8 +37,9 @@ def main():
     # Path to the full-resolution microscope image
     img_path = 'Human_Colorectal/input/Visium_HD_Human_Colon_Cancer_tissue_image.btf'
 
-    # Output path for the cropped image
-    output_path = 'workspace_outputs/cropped_visium_hd_human_Colorectal.png'
+    # Output path for the cropped image. Keep generated preprocessing artifacts
+    # under the reusable intermediate directory rather than mixing them into repo root.
+    output_path = 'workspace_outputs/human_colorectal/intermediate/cropped_visium_hd_human_Colorectal.png'
 
     # Image format: 'HE' for H&E staining, 'DAPI' for fluorescence
     image_format = 'HE'
@@ -61,6 +62,8 @@ def main():
 
     print("Starting image cropping process...")
     print()
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     try:
         result = prepare_dataframe_image(

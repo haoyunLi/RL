@@ -14,6 +14,12 @@ from .reward import (
     compute_bin_log_likelihood_by_type,
     compute_reference_distribution,
 )
+from .reward_grid_search import (
+    GridAxis,
+    RewardGridSearchConfig,
+    run_reward_grid_search,
+    run_reward_grid_search_from_config,
+)
 from .state import CellAssignmentState
 
 __all__ = [
@@ -28,13 +34,17 @@ __all__ = [
     "NucleusRecord",
     "Policy",
     "PosteriorAddBinReward",
+    "GridAxis",
     "RandomPolicy",
     "RewardFunction",
+    "RewardGridSearchConfig",
     "ZeroReward",
     "build_episode_for_cell",
     "build_episodes",
     "run_episode_build",
     "run_episode_build_from_config",
+    "run_reward_grid_search",
+    "run_reward_grid_search_from_config",
     "compute_bin_log_likelihood_by_type",
     "compute_reference_distribution",
 ]

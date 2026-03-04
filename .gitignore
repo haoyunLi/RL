@@ -10,7 +10,7 @@ runs/
 jobs/
 tmp_episode_build_test/
 workspace_outputs/
-
+colorectal_sc_data/
 # Local conda/venv-style environments in repo
 cellpose/
 Bin2Cell_Validation/
