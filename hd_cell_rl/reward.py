@@ -129,7 +129,7 @@ class PosteriorAddBinReward:
         self,
         reference_counts: np.ndarray,
         candidate_bin_ids: list[str] | tuple[str, ...],
-        candidate_expression: np.ndarray,
+        candidate_expression: np.ndarray | None,
         candidate_bin_xy_um: np.ndarray,
         nucleus_center_xy_um: np.ndarray,
         other_nuclei_center_xy_um: np.ndarray | None = None,
@@ -143,6 +143,8 @@ class PosteriorAddBinReward:
         normalize_expression_zscore: bool = False,
         zscore_delta: float = 1e-8,
         remove_reward: float = 0.0,
+        precomputed_ll: np.ndarray | None = None,
+        precomputed_d_other_um: np.ndarray | None = None,
     ) -> None:
         """Create reward object with all static per-episode inputs.
 
@@ -172,32 +174,58 @@ class PosteriorAddBinReward:
         if len(self._bin_id_to_index) != len(self._candidate_bin_ids):
             raise ValueError("candidate_bin_ids must be unique")
 
-        self._x = np.asarray(candidate_expression, dtype=np.float64)
         self._bin_xy = np.asarray(candidate_bin_xy_um, dtype=np.float64)
         self._nucleus_center = np.asarray(nucleus_center_xy_um, dtype=np.float64)
+        n_bins = len(self._candidate_bin_ids)
 
-        if self._x.ndim != 2:
-            raise ValueError("candidate_expression must have shape (B, G)")
-
-        if self._bin_xy.shape != (self._x.shape[0], 2):
+        if self._bin_xy.shape != (n_bins, 2):
             raise ValueError("candidate_bin_xy_um must have shape (B, 2)")
 
         if self._nucleus_center.shape != (2,):
             raise ValueError("nucleus_center_xy_um must have shape (2,)")
 
-        if np.any(self._x < 0):
-            raise ValueError("candidate_expression must be non-negative")
+        if precomputed_ll is not None:
+            ll = np.asarray(precomputed_ll, dtype=np.float64)
+            if ll.ndim != 2:
+                raise ValueError("precomputed_ll must have shape (B, K)")
+            if ll.shape[0] != n_bins:
+                raise ValueError(
+                    "precomputed_ll row count must match number of candidate bins: %d != %d"
+                    % (ll.shape[0], n_bins)
+                )
+            if not np.isfinite(ll).all():
+                raise ValueError("precomputed_ll contains non-finite values")
+            self._ll = ll
+            self._n_cell_types = int(ll.shape[1])
+            if self._n_cell_types <= 0:
+                raise ValueError("precomputed_ll must have positive K dimension")
+            # Keep reference compatibility check on K even in precomputed mode.
+            ref_counts = np.asarray(reference_counts, dtype=np.float64)
+            if ref_counts.ndim != 2 or ref_counts.shape[0] != self._n_cell_types:
+                raise ValueError(
+                    "reference_counts K dimension must match precomputed_ll: %d != %d"
+                    % (ref_counts.shape[0] if ref_counts.ndim == 2 else -1, self._n_cell_types)
+                )
+        else:
+            if candidate_expression is None:
+                raise ValueError("candidate_expression must be provided when precomputed_ll is not set")
+            x = np.asarray(candidate_expression, dtype=np.float64)
+            if x.ndim != 2:
+                raise ValueError("candidate_expression must have shape (B, G)")
+            if x.shape[0] != n_bins:
+                raise ValueError("candidate_expression row count must match number of candidate bins")
+            if np.any(x < 0):
+                raise ValueError("candidate_expression must be non-negative")
 
-        self._theta = compute_reference_distribution(reference_counts=reference_counts, epsilon=epsilon)
+            theta = compute_reference_distribution(reference_counts=reference_counts, epsilon=epsilon)
+            if theta.shape[1] != x.shape[1]:
+                raise ValueError(
+                    "gene dimension mismatch: reference_counts has G=%d but candidate_expression has G=%d"
+                    % (theta.shape[1], x.shape[1])
+                )
+            self._ll = compute_bin_log_likelihood_by_type(bin_counts=x, theta=theta)  # (B, K)
+            self._n_cell_types = int(theta.shape[0])
 
-        if self._theta.shape[1] != self._x.shape[1]:
-            raise ValueError(
-                "gene dimension mismatch: reference_counts has G=%d but candidate_expression has G=%d"
-                % (self._theta.shape[1], self._x.shape[1])
-            )
-
-        self._ll = compute_bin_log_likelihood_by_type(bin_counts=self._x, theta=self._theta)  # (B, K)
-        self._n_cell_types = int(self._theta.shape[0])
         self._log_prior = -np.log(float(self._n_cell_types))
 
         # Precompute distance terms for all candidate bins.
@@ -206,15 +234,27 @@ class PosteriorAddBinReward:
         delta_n = self._bin_xy - self._nucleus_center[None, :]
         self._d_n = np.sqrt(np.sum(delta_n * delta_n, axis=1))
 
-        if other_nuclei_center_xy_um is None:
-            self._d_other = np.full(self._x.shape[0], np.inf, dtype=np.float64)
+        if precomputed_d_other_um is not None:
+            d_other = np.asarray(precomputed_d_other_um, dtype=np.float64)
+            if d_other.shape != (n_bins,):
+                raise ValueError(
+                    "precomputed_d_other_um must have shape (B,), got %r for B=%d"
+                    % (d_other.shape, n_bins)
+                )
+            if not np.isfinite(d_other).all():
+                raise ValueError("precomputed_d_other_um contains non-finite values")
+            if (d_other < 0).any():
+                raise ValueError("precomputed_d_other_um must be non-negative")
+            self._d_other = d_other
+        elif other_nuclei_center_xy_um is None:
+            self._d_other = np.full(n_bins, np.inf, dtype=np.float64)
         else:
             other = np.asarray(other_nuclei_center_xy_um, dtype=np.float64)
             if other.ndim != 2 or (other.shape[1] != 2):
                 raise ValueError("other_nuclei_center_xy_um must have shape (N, 2)")
 
             if other.shape[0] == 0:
-                self._d_other = np.full(self._x.shape[0], np.inf, dtype=np.float64)
+                self._d_other = np.full(n_bins, np.inf, dtype=np.float64)
             else:
                 # Compute nearest distance to any other nucleus per bin.
                 deltas = self._bin_xy[:, None, :] - other[None, :, :]
@@ -240,7 +280,7 @@ class PosteriorAddBinReward:
     @property
     def n_candidate_bins(self) -> int:
         """Return B, number of candidate bins in this episode."""
-        return int(self._x.shape[0])
+        return int(self._ll.shape[0])
 
     def posterior_given_state(self, membership_mask: np.ndarray) -> np.ndarray:
         """Compute p(k|ST) using uniform prior and softmax in log space."""

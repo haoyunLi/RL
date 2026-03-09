@@ -37,7 +37,10 @@ inputs:
     matrix_col_index_column: matrix_col_index
     reference_npz_path: workspace_outputs/human_colorectal/intermediate/reference_sct/reference_counts_sct_tumor_aligned_hd_overlap_unique.npz
     reference_genes_key: genes
-    max_genes: null
+    nuclei_chunk_size: 256
+    cache_size: 8000
+    n_workers: 8
+    save_compressed: true
 
 environment:
   max_center_distance_um: 80.0

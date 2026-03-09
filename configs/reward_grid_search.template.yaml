@@ -3,13 +3,15 @@ run:
   output_root: runs
   seed: 7
   max_episodes: 500
+  n_workers: 64
 
 inputs:
-  # This is auto-updated by jobs/run_episode_build_and_reward_grid_search.sbatch.
+  # This is auto-updated by jobs/run_reward_grid_search.sbatch.
   episodes_index_path: runs/example_episode_build_run/episodes_index.csv
   reference:
     path: workspace_outputs/human_colorectal/intermediate/reference_sct/reference_counts_sct_tumor_aligned_hd_overlap_unique.npz
     format: npz
+    genes_key: genes
     cell_type_column: null
     gene_mode: all
     gene_prefix: null
@@ -27,7 +29,7 @@ reward:
   objective: mean_return
   epsilon: 1.0e-8
   r_max_um: 80.0
-  normalize_expression_zscore: false
+  normalize_expression_zscore: true
   zscore_delta: 1.0e-8
 
 search:
