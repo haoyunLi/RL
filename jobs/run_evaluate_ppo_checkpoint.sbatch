@@ -5,9 +5,8 @@
 #SBATCH --time=72:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=240G
+#SBATCH --mem=120G
 #SBATCH --output=evaluate_ppo_checkpoint.out
 #SBATCH --error=evaluate_ppo_checkpoint.err
 
@@ -28,18 +27,35 @@ export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export TORCH_NUM_THREADS=16
 export TORCH_NUM_INTEROP_THREADS=1
+unset KMP_LOGFILE || true
+unset LOGFILE || true
 
-CHECKPOINT_PATH="${CHECKPOINT_PATH:-runs/human_colorectal_ppo_20260313T154239Z/checkpoints/best_model.pt}"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-runs/human_colorectal_ppo_20260408T164518Z/checkpoints/best_model.pt}"
 PPO_CONFIG="${PPO_CONFIG:-}"
 EPISODES_INDEX_PATH="${EPISODES_INDEX_PATH:-}"
 MAX_EPISODES="${MAX_EPISODES:-200}"
 POLICY_MODE="${POLICY_MODE:-greedy}"
-RUN_DEVICE="${RUN_DEVICE:-cuda}"
+RUN_DEVICE="${RUN_DEVICE:-auto}"
 EVAL_SEED="${EVAL_SEED:-7}"
 RUN_NAME="${RUN_NAME:-human_colorectal_ppo_eval}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-runs}"
 OVERLAY_MAX_CELLS="${OVERLAY_MAX_CELLS:-200}"
 OVERLAY_SELECTION="${OVERLAY_SELECTION:-top_reward}"
+GT_CELL_BINS_PATH="${GT_CELL_BINS_PATH:-workspace_outputs/pseudo_human_colorectal/intermediate/cropped_visium_hd_human_colorectal_pseudo_square_002um_cell_bins.csv.gz}"
+GT_NUCLEAR_BINS_PATH="${GT_NUCLEAR_BINS_PATH:-workspace_outputs/pseudo_human_colorectal/intermediate/cropped_visium_hd_human_colorectal_pseudo_square_002um_nuclear_bins.csv.gz}"
+GT_MIN_NUCLEAR_OVERLAP_FRAC="${GT_MIN_NUCLEAR_OVERLAP_FRAC:-0.3}"
+GT_MIN_NUCLEAR_OVERLAP_BINS="${GT_MIN_NUCLEAR_OVERLAP_BINS:-2}"
+
+if [[ -z "$CHECKPOINT_PATH" ]]; then
+  echo "CHECKPOINT_PATH is required." >&2
+  echo "Example:" >&2
+  echo "  sbatch --export=ALL,CHECKPOINT_PATH=runs/human_colorectal_ppo_YYYYMMDDTHHMMSSZ/checkpoints/best_model.pt jobs/run_evaluate_ppo_checkpoint.sbatch" >&2
+  exit 1
+fi
+if [[ ! -f "$CHECKPOINT_PATH" ]]; then
+  echo "Checkpoint file not found: $CHECKPOINT_PATH" >&2
+  exit 1
+fi
 
 echo "CHECKPOINT_PATH: $CHECKPOINT_PATH"
 echo "PPO_CONFIG: ${PPO_CONFIG:-<from checkpoint>}"
@@ -52,6 +68,10 @@ echo "RUN_NAME: $RUN_NAME"
 echo "OUTPUT_ROOT: $OUTPUT_ROOT"
 echo "OVERLAY_MAX_CELLS: $OVERLAY_MAX_CELLS"
 echo "OVERLAY_SELECTION: $OVERLAY_SELECTION"
+echo "GT_CELL_BINS_PATH: $GT_CELL_BINS_PATH"
+echo "GT_NUCLEAR_BINS_PATH: $GT_NUCLEAR_BINS_PATH"
+echo "GT_MIN_NUCLEAR_OVERLAP_FRAC: $GT_MIN_NUCLEAR_OVERLAP_FRAC"
+echo "GT_MIN_NUCLEAR_OVERLAP_BINS: $GT_MIN_NUCLEAR_OVERLAP_BINS"
 
 CMD=(python scripts/evaluate_ppo_checkpoint.py
   --checkpoint "$CHECKPOINT_PATH"
@@ -63,6 +83,10 @@ CMD=(python scripts/evaluate_ppo_checkpoint.py
   --output-root "$OUTPUT_ROOT"
   --overlay-max-cells "$OVERLAY_MAX_CELLS"
   --overlay-selection "$OVERLAY_SELECTION"
+  --gt-cell-bins-path "$GT_CELL_BINS_PATH"
+  --gt-nuclear-bins-path "$GT_NUCLEAR_BINS_PATH"
+  --gt-min-nuclear-overlap-frac "$GT_MIN_NUCLEAR_OVERLAP_FRAC"
+  --gt-min-nuclear-overlap-bins "$GT_MIN_NUCLEAR_OVERLAP_BINS"
 )
 
 if [[ -n "$PPO_CONFIG" ]]; then

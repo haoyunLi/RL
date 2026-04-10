@@ -28,6 +28,9 @@ export OPENBLAS_NUM_THREADS=1
 REWARD_CONFIG="${REWARD_CONFIG:-configs/reward_grid_search.template.yaml}"
 EPISODES_INDEX_PATH="${EPISODES_INDEX_PATH:-}"
 EPISODE_RUN_DIR="${EPISODE_RUN_DIR:-}"
+SUPERVISED_EVAL_CSV="${SUPERVISED_EVAL_CSV:-}"
+PPO_EVAL_RUN_DIR="${PPO_EVAL_RUN_DIR:-}"
+GT_CELL_BINS_PATH="${GT_CELL_BINS_PATH:-workspace_outputs/pseudo_human_colorectal/intermediate/cropped_visium_hd_human_colorectal_pseudo_square_002um_cell_bins.csv.gz}"
 
 if [ -z "$EPISODES_INDEX_PATH" ]; then
   if [ -n "$EPISODE_RUN_DIR" ]; then
@@ -50,8 +53,23 @@ if [ ! -f "$EPISODES_INDEX_PATH" ]; then
 fi
 
 echo "Using episodes index: $EPISODES_INDEX_PATH"
+if [ -z "$SUPERVISED_EVAL_CSV" ]; then
+  if [ -n "$PPO_EVAL_RUN_DIR" ]; then
+    SUPERVISED_EVAL_CSV="${PPO_EVAL_RUN_DIR}/per_episode.csv"
+  else
+    LATEST_PPO_EVAL_RUN=$(ls -dt runs/human_colorectal_ppo_eval_* 2>/dev/null | head -n 1 || true)
+    if [ -n "$LATEST_PPO_EVAL_RUN" ]; then
+      SUPERVISED_EVAL_CSV="${LATEST_PPO_EVAL_RUN}/per_episode.csv"
+    fi
+  fi
+fi
+if [ -n "$SUPERVISED_EVAL_CSV" ]; then
+  echo "Using supervised eval CSV: $SUPERVISED_EVAL_CSV"
+fi
+echo "Using GT cell bins: $GT_CELL_BINS_PATH"
+
 TMP_REWARD_CONFIG=$(mktemp --suffix=.yaml)
-python - "$REWARD_CONFIG" "$TMP_REWARD_CONFIG" "$EPISODES_INDEX_PATH" <<'PY'
+python - "$REWARD_CONFIG" "$TMP_REWARD_CONFIG" "$EPISODES_INDEX_PATH" "$SUPERVISED_EVAL_CSV" "$GT_CELL_BINS_PATH" <<'PY'
 import sys
 from pathlib import Path
 import yaml
@@ -59,11 +77,23 @@ import yaml
 src = Path(sys.argv[1])
 dst = Path(sys.argv[2])
 episodes_index = str(Path(sys.argv[3]).resolve())
+supervised_eval_csv = sys.argv[4]
+gt_cell_bins_path = sys.argv[5]
 
 with src.open("r", encoding="utf-8") as handle:
     cfg = yaml.safe_load(handle)
 
 cfg["inputs"]["episodes_index_path"] = episodes_index
+reward = cfg.get("reward", {})
+if str(reward.get("objective", "")).strip() == "gt_shape":
+    if not supervised_eval_csv:
+        raise SystemExit("Could not resolve supervised eval CSV. Set SUPERVISED_EVAL_CSV or PPO_EVAL_RUN_DIR.")
+    if not Path(supervised_eval_csv).resolve().is_file():
+        raise SystemExit(f"Supervised eval CSV not found: {supervised_eval_csv}")
+    supervised = cfg.setdefault("supervised", {})
+    supervised["eval_csv_path"] = str(Path(supervised_eval_csv).resolve())
+    if gt_cell_bins_path:
+        supervised["gt_cell_bins_path"] = str(Path(gt_cell_bins_path).resolve())
 
 with dst.open("w", encoding="utf-8") as handle:
     yaml.safe_dump(cfg, handle, sort_keys=False)

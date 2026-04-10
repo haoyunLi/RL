@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Protocol
 
 import numpy as np
@@ -36,6 +37,203 @@ class ZeroReward:
     ) -> float:
         del previous_membership_mask, action, new_membership_mask, done, info
         return 0.0
+
+
+_SQUARE_BARCODE_RE = re.compile(r"^s_\d+um_(\d+)_(\d+)(?:-\d+)?$")
+
+
+def _estimate_grid_step(coords: np.ndarray) -> float:
+    """Estimate one axis spacing for fallback neighbor construction from XY coordinates."""
+    vals = np.unique(np.asarray(coords, dtype=np.float64))
+    if vals.size <= 1:
+        return 1.0
+    diffs = np.diff(np.sort(vals))
+    diffs = diffs[np.isfinite(diffs) & (diffs > 1.0e-6)]
+    if diffs.size == 0:
+        return 1.0
+    return float(np.min(diffs))
+
+
+def build_eight_neighbor_index(
+    candidate_bin_ids: list[str] | tuple[str, ...],
+    candidate_bin_xy_um: np.ndarray,
+) -> np.ndarray:
+    """Build fixed-width 8-neighbor index table for candidate bins.
+
+    Returns
+    -------
+    np.ndarray
+        Shape (B, 8) int32 array. Missing neighbors are encoded as -1.
+    """
+    bin_ids = tuple(str(x) for x in candidate_bin_ids)
+    xy = np.asarray(candidate_bin_xy_um, dtype=np.float64)
+    n_bins = len(bin_ids)
+    if xy.shape != (n_bins, 2):
+        raise ValueError("candidate_bin_xy_um must have shape (B, 2)")
+
+    neighbor_index = np.full((n_bins, 8), -1, dtype=np.int32)
+    if n_bins == 0:
+        return neighbor_index
+
+    grid_coords: list[tuple[int, int]] = []
+    all_parsed = True
+    for bin_id in bin_ids:
+        m = _SQUARE_BARCODE_RE.match(bin_id)
+        if m is None:
+            all_parsed = False
+            break
+        grid_coords.append((int(m.group(1)), int(m.group(2))))
+
+    if not all_parsed:
+        step_x = _estimate_grid_step(xy[:, 0])
+        step_y = _estimate_grid_step(xy[:, 1])
+        x0 = float(np.min(xy[:, 0]))
+        y0 = float(np.min(xy[:, 1]))
+        gx = np.rint((xy[:, 0] - x0) / step_x).astype(np.int64)
+        gy = np.rint((xy[:, 1] - y0) / step_y).astype(np.int64)
+        grid_coords = list(zip(gx.tolist(), gy.tolist()))
+
+    coord_to_index = {coord: idx for idx, coord in enumerate(grid_coords)}
+    offsets = (
+        (-1, -1),
+        (-1, 0),
+        (-1, 1),
+        (0, -1),
+        (0, 1),
+        (1, -1),
+        (1, 0),
+        (1, 1),
+    )
+    for idx, (gx, gy) in enumerate(grid_coords):
+        for nbr_pos, (dx, dy) in enumerate(offsets):
+            nbr_idx = coord_to_index.get((gx + dx, gy + dy))
+            if nbr_idx is not None:
+                neighbor_index[idx, nbr_pos] = int(nbr_idx)
+
+    return neighbor_index
+
+
+def compute_neighbor_support_fraction(
+    membership_mask: np.ndarray,
+    neighbor_index: np.ndarray,
+) -> np.ndarray:
+    """Return per-bin fraction of already-assigned 8-neighbors."""
+    mask = np.asarray(membership_mask, dtype=np.uint8)
+    neighbors = np.asarray(neighbor_index, dtype=np.int32)
+    if mask.ndim != 1:
+        raise ValueError("membership_mask must be a 1D array")
+    if neighbors.shape != (mask.shape[0], 8):
+        raise ValueError("neighbor_index must have shape (B, 8)")
+
+    padded = np.zeros(mask.shape[0] + 1, dtype=np.uint8)
+    padded[: mask.shape[0]] = mask
+    safe_neighbors = np.where(neighbors >= 0, neighbors, mask.shape[0])
+    touched = padded[safe_neighbors].sum(axis=1, dtype=np.uint8)
+    return touched.astype(np.float64) / 8.0
+
+
+def smooth_expression_by_eight_neighbors(
+    expression: np.ndarray,
+    neighbor_index: np.ndarray,
+    *,
+    include_self: bool = True,
+) -> np.ndarray:
+    """Average each bin expression with its available 8-neighbors."""
+    x = np.asarray(expression, dtype=np.float64)
+    neighbors = np.asarray(neighbor_index, dtype=np.int32)
+    if x.ndim != 2:
+        raise ValueError("expression must have shape (B, G)")
+    if neighbors.shape != (x.shape[0], 8):
+        raise ValueError("neighbor_index must have shape (B, 8)")
+
+    out = np.zeros_like(x, dtype=np.float64)
+    counts = np.zeros((x.shape[0],), dtype=np.float64)
+    if include_self:
+        out += x
+        counts += 1.0
+
+    for pos in range(8):
+        nbr = neighbors[:, pos]
+        valid = nbr >= 0
+        if not np.any(valid):
+            continue
+        out[valid] += x[nbr[valid]]
+        counts[valid] += 1.0
+
+    counts = np.maximum(counts, 1.0)
+    out /= counts[:, None]
+    return out
+
+
+def compute_frontier_eligible_mask(
+    membership_mask: np.ndarray,
+    neighbor_index: np.ndarray,
+) -> np.ndarray:
+    """Return frontier-only add eligibility mask.
+
+    A bin is frontier-eligible when:
+    - it is currently unassigned, and
+    - it touches at least one already-assigned 8-neighbor.
+
+    Special case:
+    - if no bins are assigned yet, all unassigned bins are eligible.
+    """
+    mask = np.asarray(membership_mask, dtype=np.uint8)
+    if mask.ndim != 1:
+        raise ValueError("membership_mask must be a 1D array")
+    unassigned = mask == 0
+    if mask.size == 0:
+        return unassigned
+    if not np.any(mask == 1):
+        return unassigned
+    support = compute_neighbor_support_fraction(mask, neighbor_index)
+    return unassigned & (support > 0.0)
+
+
+def compute_stop_delta(
+    add_rewards: np.ndarray,
+    eligible_mask: np.ndarray,
+    *,
+    stop_stat: str = "max",
+    stop_top_k: int = 3,
+) -> float:
+    """Summarize remaining add opportunities for STOP reward.
+
+    Parameters
+    ----------
+    add_rewards:
+        Per-bin ADD rewards.
+    eligible_mask:
+        Boolean mask over add-eligible bins.
+    stop_stat:
+        One of:
+        - ``max``: use the single best eligible ADD reward.
+        - ``topk_mean``: use the mean of the top-k eligible ADD rewards.
+    stop_top_k:
+        Number of best eligible rewards to average when ``stop_stat='topk_mean'``.
+        If fewer than k bins are eligible, average all eligible bins.
+    """
+    rewards = np.asarray(add_rewards, dtype=np.float64)
+    eligible = np.asarray(eligible_mask, dtype=bool)
+    if rewards.ndim != 1:
+        raise ValueError("add_rewards must be a 1D array")
+    if eligible.shape != rewards.shape:
+        raise ValueError("eligible_mask must have the same shape as add_rewards")
+    if not np.any(eligible):
+        return 0.0
+
+    eligible_rewards = rewards[eligible]
+    if stop_stat == "max":
+        return float(np.max(eligible_rewards))
+    if stop_stat == "topk_mean":
+        if stop_top_k <= 0:
+            raise ValueError("stop_top_k must be > 0 when stop_stat='topk_mean'")
+        k = int(min(stop_top_k, eligible_rewards.shape[0]))
+        if k == eligible_rewards.shape[0]:
+            return float(np.mean(eligible_rewards))
+        top_idx = np.argpartition(eligible_rewards, -k)[-k:]
+        return float(np.mean(eligible_rewards[top_idx]))
+    raise ValueError(f"unsupported stop_stat: {stop_stat!r}")
 
 
 def compute_reference_distribution(reference_counts: np.ndarray, epsilon: float) -> np.ndarray:
@@ -121,8 +319,10 @@ class PosteriorAddBinReward:
     - theta[k,g] from reference counts with pseudocount epsilon
     - LL[b,k] per bin/type normalized by bin total counts
     - p(k|ST) from softmax(log p(ST|k) + uniform prior)
-    - R_add[b] = w1 * R_expr[b] - w2 * P_dis[b] - w3 * P_overlap[b]
-    - R_stop = -lambda * max_b R_add[b] over currently add-eligible bins
+    - neighbor_support[b] = touched_8_neighbors[b] / 8
+    - R_add[b] = w1 * R_expr[b] - w2 * P_dis[b] - w3 * P_overlap[b] + w4 * neighbor_support[b]
+    - R_stop = -lambda * stop_delta over currently add-eligible bins
+      where stop_delta is either max frontier add reward or mean(top-k frontier add rewards)
     """
 
     def __init__(
@@ -139,7 +339,10 @@ class PosteriorAddBinReward:
         w1: float = 1.0,
         w2: float = 1.0,
         w3: float = 1.0,
+        w4: float = 0.0,
         stop_lambda: float = 1.0,
+        stop_stat: str = "max",
+        stop_top_k: int = 3,
         normalize_expression_zscore: bool = False,
         zscore_delta: float = 1e-8,
         remove_reward: float = 0.0,
@@ -265,12 +468,20 @@ class PosteriorAddBinReward:
         self._w1 = float(w1)
         self._w2 = float(w2)
         self._w3 = float(w3)
+        self._w4 = float(w4)
         self._stop_lambda = float(stop_lambda)
+        self._stop_stat = str(stop_stat).strip().lower()
+        if self._stop_stat not in {"max", "topk_mean"}:
+            raise ValueError("stop_stat must be 'max' or 'topk_mean'")
+        self._stop_top_k = int(stop_top_k)
+        if self._stop_top_k <= 0:
+            raise ValueError("stop_top_k must be > 0")
         self._normalize_expression_zscore = bool(normalize_expression_zscore)
         self._zscore_delta = float(zscore_delta)
         self._remove_reward = float(remove_reward)
         self._p_dis = self._d_n / self._r_max_um
         self._p_overlap = np.maximum(0.0, (self._d_n - self._d_other) / self._r_max_um)
+        self._neighbor_index = build_eight_neighbor_index(self._candidate_bin_ids, self._bin_xy)
 
     @property
     def n_cell_types(self) -> int:
@@ -317,12 +528,12 @@ class PosteriorAddBinReward:
     def add_reward_per_bin(self, membership_mask: np.ndarray) -> np.ndarray:
         """Compute R_add[b] for all candidate bins given current state ST."""
         mask = self._validate_membership_mask(membership_mask)
+        eligible = self.frontier_add_mask(mask)
 
         posterior = self.posterior_given_state(mask)
         r_expr = np.sum(self._ll * posterior[None, :], axis=1)
 
         if self._normalize_expression_zscore:
-            eligible = mask == 0
             if np.any(eligible):
                 mu = float(np.mean(r_expr[eligible]))
                 sigma = float(np.std(r_expr[eligible], ddof=0))
@@ -332,21 +543,32 @@ class PosteriorAddBinReward:
         else:
             expr_term = r_expr
 
-        r_add = self._w1 * expr_term - self._w2 * self._p_dis - self._w3 * self._p_overlap
+        neighbor_support = compute_neighbor_support_fraction(mask, self._neighbor_index)
+        r_add = (
+            self._w1 * expr_term
+            - self._w2 * self._p_dis
+            - self._w3 * self._p_overlap
+            + self._w4 * neighbor_support
+        )
         return r_add
 
     def stop_reward(self, membership_mask: np.ndarray) -> float:
-        """Compute R_stop = -lambda * max_b R_add[b] over currently add-eligible bins."""
-        mask = self._validate_membership_mask(membership_mask)
-        eligible = mask == 0
-
-        if not np.any(eligible):
-            delta_t = 0.0
-        else:
-            r_add = self.add_reward_per_bin(mask)
-            delta_t = float(np.max(r_add[eligible]))
-
+        """Compute R_stop from remaining eligible ADD rewards."""
+        delta_t = self.stop_delta(membership_mask)
         return -self._stop_lambda * delta_t
+
+    def stop_delta(self, membership_mask: np.ndarray) -> float:
+        """Return summarized remaining ADD opportunity used by STOP logic."""
+        mask = self._validate_membership_mask(membership_mask)
+        eligible = self.frontier_add_mask(mask)
+
+        r_add = self.add_reward_per_bin(mask)
+        return compute_stop_delta(
+            r_add,
+            eligible,
+            stop_stat=self._stop_stat,
+            stop_top_k=self._stop_top_k,
+        )
 
     def evaluate_state(self, membership_mask: np.ndarray) -> dict[str, np.ndarray | float]:
         """Return p(k|ST), R_add per bin, and R_stop for one state ST."""
@@ -359,6 +581,7 @@ class PosteriorAddBinReward:
             "p_k_given_ST": p_k_given_st,
             "R_add": r_add,
             "R_stop": float(r_stop),
+            "eligible_add_mask": self.frontier_add_mask(mask),
         }
 
     def compute(
@@ -414,6 +637,11 @@ class PosteriorAddBinReward:
 
         return mask
 
+    def frontier_add_mask(self, membership_mask: np.ndarray) -> np.ndarray:
+        """Return frontier-only add eligibility mask for the current state."""
+        mask = self._validate_membership_mask(membership_mask)
+        return compute_frontier_eligible_mask(mask, self._neighbor_index)
+
     def _add_reward_for_index(
         self,
         membership_mask: np.ndarray,
@@ -432,7 +660,7 @@ class PosteriorAddBinReward:
 
         if self._normalize_expression_zscore:
             r_expr = np.sum(self._ll * posterior[None, :], axis=1)
-            eligible = membership_mask == 0
+            eligible = self.frontier_add_mask(membership_mask)
             if np.any(eligible):
                 mu = float(np.mean(r_expr[eligible]))
                 sigma = float(np.std(r_expr[eligible], ddof=0))
@@ -446,4 +674,13 @@ class PosteriorAddBinReward:
             self._w1 * expr_term
             - self._w2 * self._p_dis[bin_index]
             - self._w3 * self._p_overlap[bin_index]
+            + self._w4 * self._neighbor_fraction_for_index(membership_mask, bin_index)
         )
+
+    def _neighbor_fraction_for_index(self, membership_mask: np.ndarray, bin_index: int) -> float:
+        """Return touched-8-neighbor fraction for one candidate bin."""
+        neighbors = self._neighbor_index[bin_index]
+        valid = neighbors >= 0
+        if not np.any(valid):
+            return 0.0
+        return float(np.sum(membership_mask[neighbors[valid]], dtype=np.float64) / 8.0)

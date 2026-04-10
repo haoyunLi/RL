@@ -32,17 +32,18 @@ Expected outputs:
 - `workspace_outputs/human_colorectal/intermediate/cropped_visium_hd_human_Colorectal_square_002um_nuclear_bins.summary.json`
 - `workspace_outputs/human_colorectal/intermediate/cropped_visium_hd_human_Colorectal_square_002um_nuclear_bins_overlay.png`
 
-## 4) Merge official expression metadata + nuclear annotation
-This step merges official HD bin metadata/expression indexing with nuclear-bin annotation into one RL-ready table.
+## 4) Merge filtered expression metadata + nuclear annotation
+This step merges official HD filtered-bin metadata/expression indexing with nuclear-bin annotation into one RL-ready table.
+The expression source can be a 10x `.h5` file or a `filtered_feature_bc_matrix/` directory.
 The merged table is the main structural input for episode construction.
 ```bash
 sbatch jobs/run_merge_square_002um_expression_with_nuclear.sbatch
 ```
 Expected outputs:
-- `workspace_outputs/human_colorectal/intermediate/square_002um_nuclear/human_colorectal_square_002um_rl.metadata.parquet`
-- `workspace_outputs/human_colorectal/intermediate/square_002um_nuclear/human_colorectal_square_002um_rl.selected_features.tsv.gz`
-- `workspace_outputs/human_colorectal/intermediate/square_002um_nuclear/human_colorectal_square_002um_rl.selected_feature_indices.npy`
-- `workspace_outputs/human_colorectal/intermediate/square_002um_nuclear/human_colorectal_square_002um_rl.manifest.json`
+- `workspace_outputs/human_colorectal/intermediate/square_002um_filtered_nuclear/human_colorectal_square_002um_filtered_rl.metadata.parquet`
+- `workspace_outputs/human_colorectal/intermediate/square_002um_filtered_nuclear/human_colorectal_square_002um_filtered_rl.selected_features.tsv.gz`
+- `workspace_outputs/human_colorectal/intermediate/square_002um_filtered_nuclear/human_colorectal_square_002um_filtered_rl.selected_feature_indices.npy`
+- `workspace_outputs/human_colorectal/intermediate/square_002um_filtered_nuclear/human_colorectal_square_002um_filtered_rl.manifest.json`
 
 ## 5) Build nuclei table (one row per nucleus)
 This step builds one nucleus-center record per cell (`center_x_um`, `center_y_um`) from segmentation outputs.

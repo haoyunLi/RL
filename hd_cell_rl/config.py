@@ -14,11 +14,11 @@ class EnvironmentConfig:
     """
 
     # Maximum distance (in micrometres) from nucleus center to keep a bin.
-    max_center_distance_um: float = 80.0
+    max_center_distance_um: float = 20.0
 
     # Optional radial-band rule: keep bin only if |rc - r| <= radius_band_um,
     # where rc is nucleus radius and r is bin distance from nucleus center.
-    radius_band_um: float | None = 80.0
+    radius_band_um: float | None = 20.0
 
     # If True, invalid actions raise errors. If False, they become no-op updates.
     strict_action_validation: bool = True

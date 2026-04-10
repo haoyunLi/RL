@@ -52,6 +52,7 @@ fi
 W1="${W1:-0.7}"
 W2="${W2:-0.7}"
 W3="${W3:-0.9}"
+W4="${W4:-0.0}"
 STOP_LAMBDA="${STOP_LAMBDA:-0.9}"
 MAX_EPISODES="${MAX_EPISODES:-500}"
 N_WORKERS="${N_WORKERS:-64}"
@@ -64,7 +65,7 @@ fi
 
 echo "Config: $CONFIG_PATH"
 echo "Episodes: $EPISODES_INDEX_PATH"
-echo "Weights: w1=$W1 w2=$W2 w3=$W3 stop_lambda=$STOP_LAMBDA"
+echo "Weights: w1=$W1 w2=$W2 w3=$W3 w4=$W4 stop_lambda=$STOP_LAMBDA"
 echo "Eval params: max_episodes=$MAX_EPISODES n_workers=$N_WORKERS run_name=$RUN_NAME seed=$EVAL_SEED"
 
 python scripts/evaluate_reward_weights.py \
@@ -73,6 +74,7 @@ python scripts/evaluate_reward_weights.py \
   --w1 "$W1" \
   --w2 "$W2" \
   --w3 "$W3" \
+  --w4 "$W4" \
   --stop-lambda "$STOP_LAMBDA" \
   --max-episodes "$MAX_EPISODES" \
   --n-workers "$N_WORKERS" \

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 import datetime as dt
 import itertools
@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import h5py
 import numpy as np
@@ -21,7 +22,14 @@ import pandas as pd
 from scipy.spatial import cKDTree
 import yaml
 
-from .reward import PosteriorAddBinReward, compute_bin_log_likelihood_by_type, compute_reference_distribution
+from .matrix_io import resolve_matrix_csc_h5_path
+from .reward import (
+    PosteriorAddBinReward,
+    build_eight_neighbor_index,
+    compute_bin_log_likelihood_by_type,
+    compute_reference_distribution,
+    smooth_expression_by_eight_neighbors,
+)
 
 
 class ConfigError(ValueError):
@@ -29,6 +37,10 @@ class ConfigError(ValueError):
 
 
 _REWARD_GRID_WORKER_CONTEXT: dict[str, Any] | None = None
+_ARTIFACT_SHARD_CACHE: OrderedDict[str, dict[str, np.ndarray]] = OrderedDict()
+_ARTIFACT_SHARD_CACHE_SIZE = 8
+_LOCAL_TIMEZONE = ZoneInfo("America/Chicago")
+_LOCAL_TIMEZONE_NAME = "America/Chicago"
 
 
 @dataclass(frozen=True)
@@ -43,8 +55,8 @@ class GridAxis:
         """Return rounded inclusive values from start to stop."""
         if self.step <= 0:
             raise ConfigError("grid step must be > 0")
-        if self.start <= 0 or self.stop <= 0:
-            raise ConfigError("grid values must be > 0")
+        if self.start < 0 or self.stop < 0:
+            raise ConfigError("grid values must be >= 0")
         if self.stop < self.start:
             raise ConfigError("grid stop must be >= start")
 
@@ -64,6 +76,36 @@ class GridAxis:
         if not values:
             raise ConfigError("grid axis produced no values")
         return tuple(values)
+
+
+@dataclass(frozen=True)
+class SupervisedRewardConfig:
+    """Config for GT-shape-supervised weight tuning over a selected cohort."""
+
+    eval_csv_path: Path
+    gt_cell_bins_path: Path
+    selection_mode: str
+    require_match_method: str | None
+    overgrowth_ratio_threshold: float
+    max_selected_episodes: int | None
+    target_size_ratio: float
+    oversize_penalty_weight: float
+    size_ratio_filter_min: float | None
+    size_ratio_filter_max: float | None
+
+    def to_serializable_dict(self) -> dict[str, Any]:
+        return {
+            "eval_csv_path": str(self.eval_csv_path),
+            "gt_cell_bins_path": str(self.gt_cell_bins_path),
+            "selection_mode": self.selection_mode,
+            "require_match_method": self.require_match_method,
+            "overgrowth_ratio_threshold": self.overgrowth_ratio_threshold,
+            "max_selected_episodes": self.max_selected_episodes,
+            "target_size_ratio": self.target_size_ratio,
+            "oversize_penalty_weight": self.oversize_penalty_weight,
+            "size_ratio_filter_min": self.size_ratio_filter_min,
+            "size_ratio_filter_max": self.size_ratio_filter_max,
+        }
 
 
 @dataclass(frozen=True)
@@ -92,10 +134,15 @@ class RewardGridSearchConfig:
     r_max_um: float
     normalize_expression_zscore: bool
     zscore_delta: float
+    w4: float
     w1_axis: GridAxis
     w2_axis: GridAxis
     w3_axis: GridAxis
+    w4_axis: GridAxis
     stop_lambda_axis: GridAxis
+    stop_stat: str
+    stop_top_k: int
+    supervised: SupervisedRewardConfig | None
 
     def to_serializable_dict(self) -> dict[str, Any]:
         """Return config as plain Python types for YAML/JSON output."""
@@ -131,13 +178,18 @@ class RewardGridSearchConfig:
                 "r_max_um": self.r_max_um,
                 "normalize_expression_zscore": self.normalize_expression_zscore,
                 "zscore_delta": self.zscore_delta,
+                "w4": self.w4,
+                "stop_stat": self.stop_stat,
+                "stop_top_k": self.stop_top_k,
             },
             "search": {
                 "w1": _axis_to_dict(self.w1_axis),
                 "w2": _axis_to_dict(self.w2_axis),
                 "w3": _axis_to_dict(self.w3_axis),
+                "w4": _axis_to_dict(self.w4_axis),
                 "stop_lambda": _axis_to_dict(self.stop_lambda_axis),
             },
+            "supervised": None if self.supervised is None else self.supervised.to_serializable_dict(),
         }
 
 
@@ -147,10 +199,24 @@ class PreparedEpisodeRewardData:
 
     cell_id: str
     candidate_bin_ids: tuple[str, ...]
+    initial_membership_mask: np.ndarray
     candidate_bin_xy_um: np.ndarray
     nucleus_center_xy_um: np.ndarray
     precomputed_ll: np.ndarray
     precomputed_d_other_um: np.ndarray
+    matched_gt_cell_id: str | None = None
+    gt_candidate_mask: np.ndarray | None = None
+    gt_candidate_bin_count: int = 0
+    gt_full_bin_count: int = 0
+    eval_size_ratio: float | None = None
+
+
+@dataclass(frozen=True)
+class EpisodeArtifactLocator:
+    """Resolved storage reference for one episode artifact."""
+
+    path: Path
+    member_index: int | None
 
 
 @dataclass(frozen=True)
@@ -168,6 +234,26 @@ class RewardGridPreparedContext:
 
     reference_counts: np.ndarray
     episodes: list[PreparedEpisodeRewardData]
+    preparation_summary: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class SupervisedEpisodeTarget:
+    """GT target metadata for one selected episode cell."""
+
+    episode_cell_id: str
+    matched_gt_cell_id: str
+    gt_full_bin_count: int
+    eval_assigned_bin_count: int
+    eval_size_ratio: float
+
+
+@dataclass(frozen=True)
+class SupervisedSelectionBundle:
+    """Selected overgrowth tuning cohort from a prior evaluation run."""
+
+    targets_by_cell_id: dict[str, SupervisedEpisodeTarget]
+    summary: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -179,6 +265,7 @@ class GreedyEpisodeMetrics:
     n_add_actions: int
     stop_reward: float
     final_best_add: float
+    final_membership_mask: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -188,6 +275,7 @@ class RewardGridSearchResult:
     w1: float
     w2: float
     w3: float
+    w4: float
     stop_lambda: float
     n_episodes: int
     mean_return: float
@@ -195,11 +283,23 @@ class RewardGridSearchResult:
     mean_add_actions: float
     mean_stop_reward: float
     mean_final_best_add: float
+    mean_gt_iou: float | None = None
+    mean_gt_dice: float | None = None
+    mean_gt_precision: float | None = None
+    mean_gt_recall: float | None = None
+    mean_gt_size_ratio: float | None = None
+    mean_oversize_excess: float | None = None
+    mean_oversize_penalty: float | None = None
+    gt_shape_score: float | None = None
 
     def objective_value(self, objective: str) -> float:
         """Return comparable scalar used for best-weight selection."""
         if objective == "mean_return":
             return self.mean_return
+        if objective == "gt_shape":
+            if self.gt_shape_score is None:
+                raise ConfigError("gt_shape objective requested but supervised metrics are missing")
+            return self.gt_shape_score
         raise ConfigError(f"unsupported objective: {objective!r}")
 
     def to_row(self, objective: str) -> dict[str, Any]:
@@ -208,6 +308,7 @@ class RewardGridSearchResult:
             "w1": self.w1,
             "w2": self.w2,
             "w3": self.w3,
+            "w4": self.w4,
             "stop_lambda": self.stop_lambda,
             "n_episodes": self.n_episodes,
             "mean_return": self.mean_return,
@@ -215,9 +316,188 @@ class RewardGridSearchResult:
             "mean_add_actions": self.mean_add_actions,
             "mean_stop_reward": self.mean_stop_reward,
             "mean_final_best_add": self.mean_final_best_add,
+            "mean_gt_iou": self.mean_gt_iou,
+            "mean_gt_dice": self.mean_gt_dice,
+            "mean_gt_precision": self.mean_gt_precision,
+            "mean_gt_recall": self.mean_gt_recall,
+            "mean_gt_size_ratio": self.mean_gt_size_ratio,
+            "mean_oversize_excess": self.mean_oversize_excess,
+            "mean_oversize_penalty": self.mean_oversize_penalty,
+            "gt_shape_score": self.gt_shape_score,
             "objective": objective,
             "objective_value": self.objective_value(objective),
         }
+
+
+def _normalize_cell_id(value: Any) -> str | None:
+    """Normalize mixed int/float/string cell IDs into one stable string form."""
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, (np.integer, int)):
+        return str(int(value))
+    if isinstance(value, (np.floating, float)):
+        if not np.isfinite(value):
+            return None
+        if float(value).is_integer():
+            return str(int(value))
+        return str(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    if re.fullmatch(r"[+-]?\d+\.0+", text):
+        return text.split(".", 1)[0]
+    return text
+
+
+def _load_nuclear_barcode_assignment_lookup(bins_path: Path) -> dict[str, str]:
+    """Load confident nuclear barcode -> cell_id assignments from merged bins metadata."""
+    if not bins_path.exists():
+        raise FileNotFoundError(f"episode-build bins metadata not found: {bins_path}")
+
+    df = pd.read_parquet(
+        bins_path,
+        columns=[
+            "barcode",
+            "has_nuclear_annotation",
+            "dominant_cell_id",
+            "ambiguous_nuclear_assignment",
+        ],
+    )
+    if len(df) == 0:
+        return {}
+
+    has_nuclear = df["has_nuclear_annotation"].fillna(False).astype(bool)
+    ambiguous = df["ambiguous_nuclear_assignment"].fillna(False).astype(bool)
+    out = df.loc[has_nuclear & ~ambiguous, ["barcode", "dominant_cell_id"]].copy()
+    if out.empty:
+        return {}
+
+    out["cell_id"] = out["dominant_cell_id"].map(_normalize_cell_id)
+    out = out.loc[out["cell_id"].notna()].copy()
+    if out.empty:
+        return {}
+
+    return {
+        str(barcode): str(cell_id)
+        for barcode, cell_id in zip(out["barcode"].astype(str), out["cell_id"].astype(str), strict=False)
+    }
+
+
+def _build_initial_membership_mask(
+    *,
+    candidate_bin_ids: tuple[str, ...],
+    cell_id: str,
+    nuclear_barcode_to_cell: dict[str, str],
+) -> np.ndarray:
+    """Seed greedy reward evaluation with all confident nuclear bins for this cell."""
+    if not candidate_bin_ids:
+        return np.zeros((0,), dtype=np.int8)
+    normalized_cell_id = _normalize_cell_id(cell_id)
+    return np.asarray(
+        [
+            1 if normalized_cell_id is not None and nuclear_barcode_to_cell.get(str(bin_id)) == normalized_cell_id else 0
+            for bin_id in candidate_bin_ids
+        ],
+        dtype=np.int8,
+    )
+
+
+def _load_supervised_selection(
+    supervised: SupervisedRewardConfig,
+    rng: np.random.Generator,
+) -> SupervisedSelectionBundle:
+    """Load GT-supervised cohort from a prior evaluation CSV and keep overgrowth cases only."""
+    if not supervised.eval_csv_path.exists():
+        raise FileNotFoundError(f"supervised eval CSV not found: {supervised.eval_csv_path}")
+
+    eval_df = pd.read_csv(supervised.eval_csv_path)
+    required = ["cell_id", "matched_gt_cell_id", "gt_cell_bin_count", "n_assigned_bins"]
+    missing = [col for col in required if col not in eval_df.columns]
+    if missing:
+        raise ValueError(f"supervised eval CSV missing required columns: {missing}")
+
+    work = eval_df.copy()
+    work["episode_cell_id"] = work["cell_id"].map(_normalize_cell_id)
+    work["matched_gt_cell_id_norm"] = work["matched_gt_cell_id"].map(_normalize_cell_id)
+    work["gt_cell_bin_count"] = pd.to_numeric(work["gt_cell_bin_count"], errors="coerce")
+    work["n_assigned_bins"] = pd.to_numeric(work["n_assigned_bins"], errors="coerce")
+    work = work.loc[
+        work["episode_cell_id"].notna()
+        & work["matched_gt_cell_id_norm"].notna()
+        & work["gt_cell_bin_count"].notna()
+        & work["n_assigned_bins"].notna()
+        & (work["gt_cell_bin_count"] > 0)
+    ].copy()
+    if supervised.require_match_method is not None and "match_method" in work.columns:
+        work = work.loc[work["match_method"].astype(str) == supervised.require_match_method].copy()
+    work["size_ratio"] = work["n_assigned_bins"] / work["gt_cell_bin_count"]
+    work = work.loc[work["size_ratio"] >= float(supervised.overgrowth_ratio_threshold)].copy()
+    if work.empty:
+        raise ValueError(
+            "supervised overgrowth cohort is empty; adjust eval CSV or overgrowth_ratio_threshold"
+        )
+
+    work = work.drop_duplicates(subset=["episode_cell_id"], keep="first").reset_index(drop=True)
+    n_candidates = int(len(work))
+    if supervised.max_selected_episodes is not None and len(work) > supervised.max_selected_episodes:
+        keep = np.sort(rng.choice(len(work), size=supervised.max_selected_episodes, replace=False))
+        work = work.iloc[keep].reset_index(drop=True)
+
+    targets: dict[str, SupervisedEpisodeTarget] = {}
+    for row in work.itertuples(index=False):
+        episode_cell_id = str(row.episode_cell_id)
+        targets[episode_cell_id] = SupervisedEpisodeTarget(
+            episode_cell_id=episode_cell_id,
+            matched_gt_cell_id=str(row.matched_gt_cell_id_norm),
+            gt_full_bin_count=int(row.gt_cell_bin_count),
+            eval_assigned_bin_count=int(row.n_assigned_bins),
+            eval_size_ratio=float(row.size_ratio),
+        )
+
+    summary = {
+        "selection_mode": supervised.selection_mode,
+        "require_match_method": supervised.require_match_method,
+        "overgrowth_ratio_threshold": float(supervised.overgrowth_ratio_threshold),
+        "target_size_ratio": float(supervised.target_size_ratio),
+        "oversize_penalty_weight": float(supervised.oversize_penalty_weight),
+        "eval_rows": int(len(eval_df)),
+        "eligible_overgrowth_rows": n_candidates,
+        "selected_episode_count": int(len(targets)),
+        "selected_mean_eval_size_ratio": float(work["size_ratio"].mean()),
+        "selected_median_eval_size_ratio": float(work["size_ratio"].median()),
+    }
+    return SupervisedSelectionBundle(targets_by_cell_id=targets, summary=summary)
+
+
+def _load_gt_cell_barcode_lookup(
+    *,
+    gt_cell_bins_path: Path,
+    gt_cell_ids: set[str],
+) -> dict[str, set[str]]:
+    """Load GT outer-cell barcode sets for only the requested GT cell IDs."""
+    if not gt_cell_bins_path.exists():
+        raise FileNotFoundError(f"GT cell bins file not found: {gt_cell_bins_path}")
+    if not gt_cell_ids:
+        return {}
+
+    out: dict[str, set[str]] = defaultdict(set)
+    suffixes = "".join(gt_cell_bins_path.suffixes).lower()
+    if suffixes.endswith(".parquet") or gt_cell_bins_path.suffix.lower() in {".parquet", ".pq"}:
+        table = pd.read_parquet(gt_cell_bins_path, columns=["cell_id", "barcode"])
+        table["cell_id_norm"] = table["cell_id"].map(_normalize_cell_id)
+        table = table.loc[table["cell_id_norm"].isin(gt_cell_ids), ["cell_id_norm", "barcode"]].copy()
+        for gt_cell_id, group in table.groupby("cell_id_norm", sort=False):
+            out[str(gt_cell_id)].update(group["barcode"].astype(str).tolist())
+        return dict(out)
+
+    for chunk in pd.read_csv(gt_cell_bins_path, usecols=["cell_id", "barcode"], chunksize=2_000_000):
+        chunk["cell_id_norm"] = chunk["cell_id"].map(_normalize_cell_id)
+        chunk = chunk.loc[chunk["cell_id_norm"].isin(gt_cell_ids), ["cell_id_norm", "barcode"]]
+        if chunk.empty:
+            continue
+        for gt_cell_id, group in chunk.groupby("cell_id_norm", sort=False):
+            out[str(gt_cell_id)].update(group["barcode"].astype(str).tolist())
+    return dict(out)
 
 
 def load_reward_grid_search_config(config_path: str | Path) -> RewardGridSearchConfig:
@@ -236,6 +516,7 @@ def load_reward_grid_search_config(config_path: str | Path) -> RewardGridSearchC
     inputs = _as_dict(raw.get("inputs"), "inputs")
     reward_cfg = _as_dict(raw.get("reward"), "reward")
     search = _as_dict(raw.get("search"), "search")
+    supervised_cfg = _as_dict(raw.get("supervised"), "supervised")
 
     run_name = str(run.get("name", "reward_grid_search"))
     if not run_name.strip():
@@ -282,8 +563,8 @@ def load_reward_grid_search_config(config_path: str | Path) -> RewardGridSearchC
     nuclei_columns = _default_nuclei_center_columns(_as_dict(nuclei_cfg.get("columns", {}), "inputs.nuclei.columns"))
 
     objective = str(reward_cfg.get("objective", "mean_return"))
-    if objective not in {"mean_return"}:
-        raise ConfigError("reward.objective must be 'mean_return'")
+    if objective not in {"mean_return", "gt_shape"}:
+        raise ConfigError("reward.objective must be 'mean_return' or 'gt_shape'")
 
     epsilon = float(reward_cfg.get("epsilon", 1e-8))
     if epsilon < 0:
@@ -297,11 +578,81 @@ def load_reward_grid_search_config(config_path: str | Path) -> RewardGridSearchC
     zscore_delta = float(reward_cfg.get("zscore_delta", 1e-8))
     if zscore_delta <= 0:
         raise ConfigError("reward.zscore_delta must be > 0")
+    w4 = float(reward_cfg.get("w4", 0.0))
+    if w4 < 0:
+        raise ConfigError("reward.w4 must be >= 0")
+    stop_stat = str(reward_cfg.get("stop_stat", "max")).strip().lower()
+    if stop_stat not in {"max", "topk_mean"}:
+        raise ConfigError("reward.stop_stat must be 'max' or 'topk_mean'")
+    stop_top_k = int(reward_cfg.get("stop_top_k", 3))
+    if stop_top_k <= 0:
+        raise ConfigError("reward.stop_top_k must be > 0")
 
     w1_axis = _load_axis(_require(search, "w1", "search"), "search.w1")
     w2_axis = _load_axis(_require(search, "w2", "search"), "search.w2")
     w3_axis = _load_axis(_require(search, "w3", "search"), "search.w3")
+    if "w4" in search:
+        w4_axis = _load_axis(search["w4"], "search.w4")
+    else:
+        w4_axis = GridAxis(start=float(w4), stop=float(w4), step=1.0)
     stop_lambda_axis = _load_axis(_require(search, "stop_lambda", "search"), "search.stop_lambda")
+    _validate_axis_bounds(w1_axis, "search.w1", allow_zero=False)
+    _validate_axis_bounds(w2_axis, "search.w2", allow_zero=False)
+    _validate_axis_bounds(w3_axis, "search.w3", allow_zero=False)
+    _validate_axis_bounds(w4_axis, "search.w4", allow_zero=True)
+    _validate_axis_bounds(stop_lambda_axis, "search.stop_lambda", allow_zero=False)
+
+    supervised: SupervisedRewardConfig | None = None
+    if objective == "gt_shape":
+        eval_csv_path = Path(str(_require(supervised_cfg, "eval_csv_path", "supervised"))).expanduser().resolve()
+        gt_cell_bins_path = Path(str(_require(supervised_cfg, "gt_cell_bins_path", "supervised"))).expanduser().resolve()
+        selection_mode = str(supervised_cfg.get("selection_mode", "overgrowth_only")).strip() or "overgrowth_only"
+        if selection_mode != "overgrowth_only":
+            raise ConfigError("supervised.selection_mode must be 'overgrowth_only'")
+        require_match_method_raw = supervised_cfg.get("require_match_method", "nuclear_overlap")
+        require_match_method = (
+            None if require_match_method_raw in {None, ""} else str(require_match_method_raw).strip()
+        )
+        overgrowth_ratio_threshold = float(supervised_cfg.get("overgrowth_ratio_threshold", 1.4))
+        if overgrowth_ratio_threshold <= 0:
+            raise ConfigError("supervised.overgrowth_ratio_threshold must be > 0")
+        max_selected_episodes = supervised_cfg.get("max_selected_episodes", None)
+        if max_selected_episodes is not None:
+            max_selected_episodes = int(max_selected_episodes)
+            if max_selected_episodes <= 0:
+                raise ConfigError("supervised.max_selected_episodes must be > 0 when provided")
+        target_size_ratio = float(supervised_cfg.get("target_size_ratio", 1.15))
+        if target_size_ratio <= 0:
+            raise ConfigError("supervised.target_size_ratio must be > 0")
+        oversize_penalty_weight = float(supervised_cfg.get("oversize_penalty_weight", 1.0))
+        if oversize_penalty_weight < 0:
+            raise ConfigError("supervised.oversize_penalty_weight must be >= 0")
+        size_ratio_filter_min_raw = supervised_cfg.get("size_ratio_filter_min", 1.0)
+        size_ratio_filter_max_raw = supervised_cfg.get("size_ratio_filter_max", 1.15)
+        size_ratio_filter_min = None if size_ratio_filter_min_raw is None else float(size_ratio_filter_min_raw)
+        size_ratio_filter_max = None if size_ratio_filter_max_raw is None else float(size_ratio_filter_max_raw)
+        if size_ratio_filter_min is not None and size_ratio_filter_min <= 0:
+            raise ConfigError("supervised.size_ratio_filter_min must be > 0 when provided")
+        if size_ratio_filter_max is not None and size_ratio_filter_max <= 0:
+            raise ConfigError("supervised.size_ratio_filter_max must be > 0 when provided")
+        if (
+            size_ratio_filter_min is not None
+            and size_ratio_filter_max is not None
+            and size_ratio_filter_max <= size_ratio_filter_min
+        ):
+            raise ConfigError("supervised.size_ratio_filter_max must be > supervised.size_ratio_filter_min")
+        supervised = SupervisedRewardConfig(
+            eval_csv_path=eval_csv_path,
+            gt_cell_bins_path=gt_cell_bins_path,
+            selection_mode=selection_mode,
+            require_match_method=require_match_method,
+            overgrowth_ratio_threshold=overgrowth_ratio_threshold,
+            max_selected_episodes=max_selected_episodes,
+            target_size_ratio=target_size_ratio,
+            oversize_penalty_weight=oversize_penalty_weight,
+            size_ratio_filter_min=size_ratio_filter_min,
+            size_ratio_filter_max=size_ratio_filter_max,
+        )
 
     return RewardGridSearchConfig(
         run_name=run_name,
@@ -326,10 +677,15 @@ def load_reward_grid_search_config(config_path: str | Path) -> RewardGridSearchC
         r_max_um=r_max_um,
         normalize_expression_zscore=normalize_expression_zscore,
         zscore_delta=zscore_delta,
+        w4=w4,
         w1_axis=w1_axis,
         w2_axis=w2_axis,
         w3_axis=w3_axis,
+        w4_axis=w4_axis,
         stop_lambda_axis=stop_lambda_axis,
+        stop_stat=stop_stat,
+        stop_top_k=stop_top_k,
+        supervised=supervised,
     )
 
 
@@ -337,6 +693,18 @@ def prepare_reward_grid_context(config: RewardGridSearchConfig) -> RewardGridPre
     """Load reference + episode artifacts once and precompute static reward terms."""
     rng = np.random.default_rng(config.seed)
     reference_counts = _load_reference_counts(config)
+    preparation_summary: dict[str, Any] | None = None
+
+    supervised_selection: SupervisedSelectionBundle | None = None
+    gt_barcodes_by_cell: dict[str, set[str]] | None = None
+    if config.supervised is not None:
+        supervised_selection = _load_supervised_selection(config.supervised, rng)
+        gt_barcodes_by_cell = _load_gt_cell_barcode_lookup(
+            gt_cell_bins_path=config.supervised.gt_cell_bins_path,
+            gt_cell_ids={target.matched_gt_cell_id for target in supervised_selection.targets_by_cell_id.values()},
+        )
+        preparation_summary = dict(supervised_selection.summary)
+        preparation_summary["loaded_gt_cell_count"] = int(len(gt_barcodes_by_cell))
 
     nuclei_df = _load_table(config.nuclei_path, config.nuclei_format)
     nuclei_centers = _build_nuclei_centers(df=nuclei_df, columns=config.nuclei_columns)
@@ -353,11 +721,19 @@ def prepare_reward_grid_context(config: RewardGridSearchConfig) -> RewardGridPre
         reference_path=config.reference_path,
         reference_format=config.reference_format,
         reference_genes_key=config.reference_genes_key,
+        supervised_targets=None if supervised_selection is None else supervised_selection.targets_by_cell_id,
+        gt_barcodes_by_cell=gt_barcodes_by_cell,
     )
     if not episodes:
         raise ValueError("no episodes available for reward grid search")
 
-    return RewardGridPreparedContext(reference_counts=reference_counts, episodes=episodes)
+    if preparation_summary is not None:
+        preparation_summary["prepared_episode_count"] = int(len(episodes))
+    return RewardGridPreparedContext(
+        reference_counts=reference_counts,
+        episodes=episodes,
+        preparation_summary=preparation_summary,
+    )
 
 
 def run_reward_grid_search(
@@ -385,25 +761,23 @@ def run_reward_grid_search(
 
     if prepared_context is None:
         prepared_context = prepare_reward_grid_context(config)
-        _append_step_log(
-            steps_log_path,
-            event="prepared_context_created",
-            payload={
-                "n_episodes": int(len(prepared_context.episodes)),
-                "n_cell_types": int(prepared_context.reference_counts.shape[0]),
-                "n_genes": int(prepared_context.reference_counts.shape[1]),
-            },
-        )
+        payload = {
+            "n_episodes": int(len(prepared_context.episodes)),
+            "n_cell_types": int(prepared_context.reference_counts.shape[0]),
+            "n_genes": int(prepared_context.reference_counts.shape[1]),
+        }
+        if prepared_context.preparation_summary is not None:
+            payload["preparation_summary"] = prepared_context.preparation_summary
+        _append_step_log(steps_log_path, event="prepared_context_created", payload=payload)
     else:
-        _append_step_log(
-            steps_log_path,
-            event="prepared_context_reused",
-            payload={
-                "n_episodes": int(len(prepared_context.episodes)),
-                "n_cell_types": int(prepared_context.reference_counts.shape[0]),
-                "n_genes": int(prepared_context.reference_counts.shape[1]),
-            },
-        )
+        payload = {
+            "n_episodes": int(len(prepared_context.episodes)),
+            "n_cell_types": int(prepared_context.reference_counts.shape[0]),
+            "n_genes": int(prepared_context.reference_counts.shape[1]),
+        }
+        if prepared_context.preparation_summary is not None:
+            payload["preparation_summary"] = prepared_context.preparation_summary
+        _append_step_log(steps_log_path, event="prepared_context_reused", payload=payload)
 
     reference_counts = prepared_context.reference_counts
     prepared_episodes = prepared_context.episodes
@@ -412,12 +786,14 @@ def run_reward_grid_search(
         "w1": config.w1_axis.values(),
         "w2": config.w2_axis.values(),
         "w3": config.w3_axis.values(),
+        "w4": config.w4_axis.values(),
         "stop_lambda": config.stop_lambda_axis.values(),
     }
     n_combinations = (
         len(grid_values["w1"])
         * len(grid_values["w2"])
         * len(grid_values["w3"])
+        * len(grid_values["w4"])
         * len(grid_values["stop_lambda"])
     )
     _append_step_log(
@@ -429,17 +805,19 @@ def run_reward_grid_search(
             "w1_values": list(grid_values["w1"]),
             "w2_values": list(grid_values["w2"]),
             "w3_values": list(grid_values["w3"]),
+            "w4_values": list(grid_values["w4"]),
             "stop_lambda_values": list(grid_values["stop_lambda"]),
         },
     )
 
     combo_specs = [
-        (combo_index, float(w1), float(w2), float(w3), float(stop_lambda))
-        for combo_index, (w1, w2, w3, stop_lambda) in enumerate(
+        (combo_index, float(w1), float(w2), float(w3), float(w4), float(stop_lambda))
+        for combo_index, (w1, w2, w3, w4, stop_lambda) in enumerate(
             itertools.product(
                 grid_values["w1"],
                 grid_values["w2"],
                 grid_values["w3"],
+                grid_values["w4"],
                 grid_values["stop_lambda"],
             ),
             start=1,
@@ -466,8 +844,13 @@ def run_reward_grid_search(
             "reference_counts": reference_counts,
             "epsilon": float(config.epsilon),
             "r_max_um": float(config.r_max_um),
+            "stop_stat": str(config.stop_stat),
+            "stop_top_k": int(config.stop_top_k),
             "normalize_expression_zscore": bool(config.normalize_expression_zscore),
             "zscore_delta": float(config.zscore_delta),
+            "objective": str(config.objective),
+            "supervised_target_size_ratio": None if config.supervised is None else float(config.supervised.target_size_ratio),
+            "supervised_oversize_penalty_weight": None if config.supervised is None else float(config.supervised.oversize_penalty_weight),
         }
         try:
             try:
@@ -494,7 +877,7 @@ def run_reward_grid_search(
             _REWARD_GRID_WORKER_CONTEXT = None
 
     if not use_parallel:
-        for combo_index, w1, w2, w3, stop_lambda in combo_specs:
+        for combo_index, w1, w2, w3, w4, stop_lambda in combo_specs:
             result = _evaluate_weight_combination(
                 episodes=prepared_episodes,
                 reference_counts=reference_counts,
@@ -503,9 +886,15 @@ def run_reward_grid_search(
                 w1=w1,
                 w2=w2,
                 w3=w3,
+                w4=w4,
                 stop_lambda=stop_lambda,
+                stop_stat=config.stop_stat,
+                stop_top_k=config.stop_top_k,
                 normalize_expression_zscore=config.normalize_expression_zscore,
                 zscore_delta=config.zscore_delta,
+                objective=config.objective,
+                supervised_target_size_ratio=None if config.supervised is None else config.supervised.target_size_ratio,
+                supervised_oversize_penalty_weight=None if config.supervised is None else config.supervised.oversize_penalty_weight,
             )
             results.append(result)
             _append_step_log(
@@ -518,11 +907,54 @@ def run_reward_grid_search(
                 },
             )
 
-    best_result = max(results, key=lambda row: row.objective_value(config.objective))
-
     results_df = pd.DataFrame([row.to_row(config.objective) for row in results])
     results_df = results_df.sort_values(by="objective_value", ascending=False).reset_index(drop=True)
     results_df.to_csv(run_dir / "results.csv", index=False)
+
+    selection_df = results_df
+    ratio_filter_payload: dict[str, Any] | None = None
+    if config.supervised is not None and "mean_gt_size_ratio" in results_df.columns:
+        size_ratio_filter_min = config.supervised.size_ratio_filter_min
+        size_ratio_filter_max = config.supervised.size_ratio_filter_max
+        if size_ratio_filter_min is not None or size_ratio_filter_max is not None:
+            keep = pd.Series(True, index=results_df.index)
+            if size_ratio_filter_min is not None:
+                keep = keep & (results_df["mean_gt_size_ratio"] > float(size_ratio_filter_min))
+            if size_ratio_filter_max is not None:
+                keep = keep & (results_df["mean_gt_size_ratio"] <= float(size_ratio_filter_max))
+            filtered_df = results_df.loc[keep].copy().reset_index(drop=True)
+            filtered_df.to_csv(run_dir / "results_size_ratio_filtered.csv", index=False)
+            ratio_filter_payload = {
+                "size_ratio_filter_min": size_ratio_filter_min,
+                "size_ratio_filter_max": size_ratio_filter_max,
+                "n_input_rows": int(len(results_df)),
+                "n_filtered_rows": int(len(filtered_df)),
+            }
+            _append_step_log(
+                steps_log_path,
+                event="size_ratio_filter_applied",
+                payload=ratio_filter_payload,
+            )
+            if filtered_df.empty:
+                raise ValueError(
+                    "no weight combinations passed supervised size-ratio filter; "
+                    "relax supervised.size_ratio_filter_min/max"
+                )
+            selection_df = filtered_df
+
+    best_row = selection_df.iloc[0].to_dict()
+    best_result = max(results, key=lambda row: row.objective_value(config.objective))
+    if ratio_filter_payload is not None:
+        # Ensure best_result matches the post-filter best row, not the global max over all rows.
+        best_result = next(
+            row
+            for row in results
+            if np.isclose(row.w1, float(best_row["w1"]))
+            and np.isclose(row.w2, float(best_row["w2"]))
+            and np.isclose(row.w3, float(best_row["w3"]))
+            and np.isclose(row.w4, float(best_row["w4"]))
+            and np.isclose(row.stop_lambda, float(best_row["stop_lambda"]))
+        )
 
     best_payload = best_result.to_row(config.objective)
     _write_yaml(config_dir / "best_weights.yaml", best_payload)
@@ -536,6 +968,10 @@ def run_reward_grid_search(
         "n_workers": int(config.n_workers),
         "best": best_payload,
     }
+    if prepared_context.preparation_summary is not None:
+        summary["preparation_summary"] = prepared_context.preparation_summary
+    if ratio_filter_payload is not None:
+        summary["size_ratio_filter"] = ratio_filter_payload
     _write_json(run_dir / "summary.json", summary)
 
     _append_step_log(
@@ -565,11 +1001,24 @@ def _evaluate_weight_combination(
     w1: float,
     w2: float,
     w3: float,
+    w4: float,
     stop_lambda: float,
+    stop_stat: str,
+    stop_top_k: int,
     normalize_expression_zscore: bool,
     zscore_delta: float,
+    objective: str,
+    supervised_target_size_ratio: float | None,
+    supervised_oversize_penalty_weight: float | None,
 ) -> RewardGridSearchResult:
     totals: list[GreedyEpisodeMetrics] = []
+    gt_iou: list[float] = []
+    gt_dice: list[float] = []
+    gt_precision: list[float] = []
+    gt_recall: list[float] = []
+    gt_size_ratio: list[float] = []
+    oversize_excess: list[float] = []
+    oversize_penalty: list[float] = []
 
     for episode in episodes:
         reward_fn = PosteriorAddBinReward(
@@ -584,13 +1033,35 @@ def _evaluate_weight_combination(
             w1=w1,
             w2=w2,
             w3=w3,
+            w4=w4,
             stop_lambda=stop_lambda,
+            stop_stat=stop_stat,
+            stop_top_k=stop_top_k,
             normalize_expression_zscore=normalize_expression_zscore,
             zscore_delta=zscore_delta,
             precomputed_ll=episode.precomputed_ll,
             precomputed_d_other_um=episode.precomputed_d_other_um,
         )
-        totals.append(_run_greedy_episode(reward_fn))
+        metrics = _run_greedy_episode(reward_fn, episode.initial_membership_mask)
+        totals.append(metrics)
+        if episode.gt_candidate_mask is not None:
+            pred_mask = np.asarray(metrics.final_membership_mask, dtype=bool)
+            gt_mask = np.asarray(episode.gt_candidate_mask, dtype=bool)
+            pred_count = int(pred_mask.sum())
+            gt_count = int(episode.gt_candidate_bin_count)
+            inter = int(np.logical_and(pred_mask, gt_mask).sum())
+            union = int(np.logical_or(pred_mask, gt_mask).sum())
+            gt_iou.append(0.0 if union <= 0 else float(inter / union))
+            denom = pred_count + gt_count
+            gt_dice.append(0.0 if denom <= 0 else float((2.0 * inter) / denom))
+            gt_precision.append(0.0 if pred_count <= 0 else float(inter / pred_count))
+            gt_recall.append(0.0 if gt_count <= 0 else float(inter / gt_count))
+            size_ratio = 0.0 if gt_count <= 0 else float(pred_count / gt_count)
+            gt_size_ratio.append(size_ratio)
+            target_ratio = 1.0 if supervised_target_size_ratio is None else float(supervised_target_size_ratio)
+            excess = max(size_ratio - target_ratio, 0.0)
+            oversize_excess.append(float(excess))
+            oversize_penalty.append(float(excess * excess))
 
     total_return = np.asarray([m.total_return for m in totals], dtype=np.float64)
     assigned_bins = np.asarray([m.assigned_bins for m in totals], dtype=np.float64)
@@ -598,10 +1069,32 @@ def _evaluate_weight_combination(
     stop_rewards = np.asarray([m.stop_reward for m in totals], dtype=np.float64)
     final_best_add = np.asarray([m.final_best_add for m in totals], dtype=np.float64)
 
+    mean_gt_iou = None
+    mean_gt_dice = None
+    mean_gt_precision = None
+    mean_gt_recall = None
+    mean_gt_size_ratio = None
+    mean_oversize_excess = None
+    mean_oversize_penalty = None
+    gt_shape_score = None
+    if gt_dice:
+        mean_gt_iou = float(np.mean(np.asarray(gt_iou, dtype=np.float64)))
+        mean_gt_dice = float(np.mean(np.asarray(gt_dice, dtype=np.float64)))
+        mean_gt_precision = float(np.mean(np.asarray(gt_precision, dtype=np.float64)))
+        mean_gt_recall = float(np.mean(np.asarray(gt_recall, dtype=np.float64)))
+        mean_gt_size_ratio = float(np.mean(np.asarray(gt_size_ratio, dtype=np.float64)))
+        mean_oversize_excess = float(np.mean(np.asarray(oversize_excess, dtype=np.float64)))
+        mean_oversize_penalty = float(np.mean(np.asarray(oversize_penalty, dtype=np.float64)))
+        penalty_weight = 0.0 if supervised_oversize_penalty_weight is None else float(supervised_oversize_penalty_weight)
+        gt_shape_score = float(mean_gt_dice - penalty_weight * mean_oversize_penalty)
+    if objective == "gt_shape" and gt_shape_score is None:
+        raise ValueError("gt_shape objective requested but no GT-supervised episodes were available")
+
     return RewardGridSearchResult(
         w1=float(w1),
         w2=float(w2),
         w3=float(w3),
+        w4=float(w4),
         stop_lambda=float(stop_lambda),
         n_episodes=len(totals),
         mean_return=float(total_return.mean()),
@@ -609,17 +1102,25 @@ def _evaluate_weight_combination(
         mean_add_actions=float(add_actions.mean()),
         mean_stop_reward=float(stop_rewards.mean()),
         mean_final_best_add=float(final_best_add.mean()),
+        mean_gt_iou=mean_gt_iou,
+        mean_gt_dice=mean_gt_dice,
+        mean_gt_precision=mean_gt_precision,
+        mean_gt_recall=mean_gt_recall,
+        mean_gt_size_ratio=mean_gt_size_ratio,
+        mean_oversize_excess=mean_oversize_excess,
+        mean_oversize_penalty=mean_oversize_penalty,
+        gt_shape_score=gt_shape_score,
     )
 
 
 def _evaluate_weight_combination_worker(
-    combo_spec: tuple[int, float, float, float, float],
+    combo_spec: tuple[int, float, float, float, float, float],
 ) -> tuple[int, RewardGridSearchResult]:
     """Process-pool worker wrapper for one weight combination."""
     if _REWARD_GRID_WORKER_CONTEXT is None:
         raise RuntimeError("reward grid worker context is not initialized")
 
-    combo_index, w1, w2, w3, stop_lambda = combo_spec
+    combo_index, w1, w2, w3, w4, stop_lambda = combo_spec
     ctx = _REWARD_GRID_WORKER_CONTEXT
     result = _evaluate_weight_combination(
         episodes=ctx["episodes"],
@@ -629,21 +1130,34 @@ def _evaluate_weight_combination_worker(
         w1=float(w1),
         w2=float(w2),
         w3=float(w3),
+        w4=float(w4),
         stop_lambda=float(stop_lambda),
+        stop_stat=str(ctx["stop_stat"]),
+        stop_top_k=int(ctx["stop_top_k"]),
         normalize_expression_zscore=bool(ctx["normalize_expression_zscore"]),
         zscore_delta=float(ctx["zscore_delta"]),
+        objective=str(ctx["objective"]),
+        supervised_target_size_ratio=ctx["supervised_target_size_ratio"],
+        supervised_oversize_penalty_weight=ctx["supervised_oversize_penalty_weight"],
     )
     return int(combo_index), result
 
 
-def _run_greedy_episode(reward_fn: PosteriorAddBinReward) -> GreedyEpisodeMetrics:
+def _run_greedy_episode(
+    reward_fn: PosteriorAddBinReward,
+    initial_membership_mask: np.ndarray,
+) -> GreedyEpisodeMetrics:
     """Roll out the simple greedy add-or-stop baseline for one episode."""
-    membership_mask = np.zeros(reward_fn.n_candidate_bins, dtype=np.int8)
+    membership_mask = np.asarray(initial_membership_mask, dtype=np.int8).copy()
+    if membership_mask.shape != (reward_fn.n_candidate_bins,):
+        raise ValueError(
+            f"initial_membership_mask must have shape ({reward_fn.n_candidate_bins},), got {membership_mask.shape}"
+        )
     total_return = 0.0
     n_add_actions = 0
 
     while True:
-        eligible = membership_mask == 0
+        eligible = reward_fn.frontier_add_mask(membership_mask)
         if not np.any(eligible):
             stop_reward = float(reward_fn.stop_reward(membership_mask))
             total_return += stop_reward
@@ -653,6 +1167,7 @@ def _run_greedy_episode(reward_fn: PosteriorAddBinReward) -> GreedyEpisodeMetric
                 n_add_actions=n_add_actions,
                 stop_reward=stop_reward,
                 final_best_add=0.0,
+                final_membership_mask=membership_mask.copy(),
             )
 
         r_add = reward_fn.add_reward_per_bin(membership_mask)
@@ -660,8 +1175,9 @@ def _run_greedy_episode(reward_fn: PosteriorAddBinReward) -> GreedyEpisodeMetric
         best_pos = int(np.argmax(r_add[eligible_idx]))
         best_idx = int(eligible_idx[best_pos])
         best_add = float(r_add[best_idx])
+        stop_delta = float(reward_fn.stop_delta(membership_mask))
 
-        if best_add <= 0.0:
+        if stop_delta <= 0.0:
             stop_reward = float(reward_fn.stop_reward(membership_mask))
             total_return += stop_reward
             return GreedyEpisodeMetrics(
@@ -670,6 +1186,7 @@ def _run_greedy_episode(reward_fn: PosteriorAddBinReward) -> GreedyEpisodeMetric
                 n_add_actions=n_add_actions,
                 stop_reward=stop_reward,
                 final_best_add=best_add,
+                final_membership_mask=membership_mask.copy(),
             )
 
         membership_mask[best_idx] = 1
@@ -766,6 +1283,8 @@ def _load_prepared_episode_reward_data(
     reference_path: Path,
     reference_format: str,
     reference_genes_key: str,
+    supervised_targets: dict[str, SupervisedEpisodeTarget] | None,
+    gt_barcodes_by_cell: dict[str, set[str]] | None,
 ) -> list[PreparedEpisodeRewardData]:
     if not episodes_index_path.exists():
         raise FileNotFoundError(f"episodes index file not found: {episodes_index_path}")
@@ -775,6 +1294,11 @@ def _load_prepared_episode_reward_data(
     missing = [col for col in required_cols if col not in index_df.columns]
     if missing:
         raise ValueError(f"missing columns in episodes index: {missing}")
+    index_df["cell_id_norm"] = index_df["cell_id"].map(_normalize_cell_id)
+    if supervised_targets is not None:
+        index_df = index_df.loc[index_df["cell_id_norm"].isin(supervised_targets)].reset_index(drop=True)
+        if index_df.empty:
+            raise ValueError("no overlap between episodes_index.csv and supervised overgrowth cohort")
 
     if max_episodes is not None and len(index_df) > max_episodes:
         keep = np.sort(rng.choice(len(index_df), size=max_episodes, replace=False))
@@ -784,21 +1308,27 @@ def _load_prepared_episode_reward_data(
     log_theta = np.log(theta)
 
     expression_ctx = _load_episode_build_expression_context(episodes_index_path)
-    matrix_h5_path = None if expression_ctx is None else expression_ctx["matrix_h5_path"]
+    matrix_path = None if expression_ctx is None else expression_ctx["matrix_path"]
     expression_cache_size = 20000 if expression_ctx is None else int(expression_ctx["cache_size"])
+    bins_path = None if expression_ctx is None else expression_ctx.get("bins_path")
     expression_loader: _MatrixOnDemandExpressionLoader | None = None
-    if matrix_h5_path is not None and reference_format == "npz":
+    nuclear_barcode_to_cell: dict[str, str] = {}
+    if matrix_path is not None and reference_format == "npz":
         expression_loader = _MatrixOnDemandExpressionLoader(
-            matrix_h5_path=matrix_h5_path,
+            matrix_path=matrix_path,
             reference_npz_path=reference_path,
             reference_genes_key=reference_genes_key,
             cache_size=expression_cache_size,
         )
+        if bins_path is not None:
+            nuclear_barcode_to_cell = _load_nuclear_barcode_assignment_lookup(Path(bins_path))
 
     prepared: list[PreparedEpisodeRewardData] = []
     try:
         for row in index_df.itertuples(index=False):
-            cell_id = str(row.cell_id)
+            cell_id_norm = _normalize_cell_id(getattr(row, "cell_id_norm", row.cell_id))
+            cell_id_raw = str(row.cell_id)
+            cell_id = cell_id_raw if cell_id_raw in nuclei_centers_by_cell else (cell_id_norm or cell_id_raw)
             artifact_path = Path(str(row.artifact_path)).expanduser().resolve()
             if cell_id not in nuclei_centers_by_cell:
                 raise ValueError(f"cell_id {cell_id!r} from episodes index is missing from nuclei table")
@@ -812,7 +1342,51 @@ def _load_prepared_episode_reward_data(
             )
             if episode is None:
                 continue
-            prepared.append(episode)
+            initial_membership_mask = _build_initial_membership_mask(
+                candidate_bin_ids=episode.candidate_bin_ids,
+                cell_id=cell_id,
+                nuclear_barcode_to_cell=nuclear_barcode_to_cell,
+            )
+            matched_gt_cell_id: str | None = None
+            gt_candidate_mask: np.ndarray | None = None
+            gt_candidate_bin_count = 0
+            gt_full_bin_count = 0
+            eval_size_ratio: float | None = None
+            if supervised_targets is not None:
+                if cell_id_norm is None:
+                    continue
+                target = supervised_targets.get(cell_id_norm)
+                if target is None:
+                    continue
+                matched_gt_cell_id = str(target.matched_gt_cell_id)
+                gt_full_bin_count = int(target.gt_full_bin_count)
+                eval_size_ratio = float(target.eval_size_ratio)
+                gt_barcodes = None if gt_barcodes_by_cell is None else gt_barcodes_by_cell.get(matched_gt_cell_id)
+                if not gt_barcodes:
+                    continue
+                gt_candidate_mask = np.asarray(
+                    [str(bin_id) in gt_barcodes for bin_id in episode.candidate_bin_ids],
+                    dtype=np.int8,
+                )
+                gt_candidate_bin_count = int(gt_candidate_mask.sum())
+                if gt_candidate_bin_count <= 0:
+                    continue
+            prepared.append(
+                PreparedEpisodeRewardData(
+                    cell_id=episode.cell_id,
+                    candidate_bin_ids=episode.candidate_bin_ids,
+                    initial_membership_mask=initial_membership_mask,
+                    candidate_bin_xy_um=episode.candidate_bin_xy_um,
+                    nucleus_center_xy_um=episode.nucleus_center_xy_um,
+                    precomputed_ll=episode.precomputed_ll,
+                    precomputed_d_other_um=episode.precomputed_d_other_um,
+                    matched_gt_cell_id=matched_gt_cell_id,
+                    gt_candidate_mask=gt_candidate_mask,
+                    gt_candidate_bin_count=gt_candidate_bin_count,
+                    gt_full_bin_count=gt_full_bin_count,
+                    eval_size_ratio=eval_size_ratio,
+                )
+            )
     finally:
         if expression_loader is not None:
             expression_loader.close()
@@ -890,41 +1464,60 @@ def _nearest_other_nucleus_distances(
 
 
 def _load_one_episode_artifact(
-    artifact_path: Path,
+    artifact_path: str | Path,
     cell_id: str,
     expression_loader: "_MatrixOnDemandExpressionLoader | None",
     theta: np.ndarray,
     log_theta: np.ndarray,
     nuclei_spatial_index: NucleiSpatialIndex,
+    include_candidate_bin_ids: bool = True,
+    smooth_neighbor_expression: bool = False,
 ) -> PreparedEpisodeRewardData | None:
-    if not artifact_path.exists():
-        raise FileNotFoundError(f"episode artifact not found: {artifact_path}")
+    locator = _parse_episode_artifact_locator(artifact_path)
+    if not locator.path.exists():
+        raise FileNotFoundError(f"episode artifact not found: {locator.path}")
 
-    with np.load(artifact_path, allow_pickle=True) as data:
-        candidate_bin_ids = tuple(str(x) for x in np.asarray(data["candidate_bin_ids"], dtype=object).tolist())
-        candidate_bin_xy_um = np.asarray(data["candidate_bin_xy_um"], dtype=np.float64)
-        nucleus_center_xy_um = np.asarray(data["nucleus_center_xy_um"], dtype=np.float64)
-        if "candidate_expression" in data:
-            candidate_expression = np.asarray(data["candidate_expression"], dtype=np.float64)
-            ll = compute_bin_log_likelihood_by_type(bin_counts=candidate_expression, theta=theta)
-        elif "candidate_matrix_col_index" in data:
-            if expression_loader is None:
-                raise ValueError(
-                    f"artifact {artifact_path} stores candidate_matrix_col_index but no matrix loader is available. "
-                    "Ensure episodes_index.csv is from a run with config/config_resolved.yaml and reference format is npz."
-                )
-            col_index = np.asarray(data["candidate_matrix_col_index"], dtype=np.int64)
-            ll = expression_loader.compute_ll_for_columns(col_index=col_index, log_theta=log_theta)
-        else:
+    if locator.member_index is None:
+        candidate_bin_ids, candidate_bin_xy_um, nucleus_center_xy_um, candidate_expression, col_index = _load_legacy_episode_artifact_payload(
+            artifact_path=locator.path,
+            include_candidate_bin_ids=include_candidate_bin_ids,
+        )
+    else:
+        candidate_bin_ids, candidate_bin_xy_um, nucleus_center_xy_um, candidate_expression, col_index = _load_sharded_episode_artifact_payload(
+            locator=locator,
+            cell_id=cell_id,
+            include_candidate_bin_ids=include_candidate_bin_ids,
+        )
+
+    if candidate_expression is not None:
+        expr = np.asarray(candidate_expression, dtype=np.float64)
+        if smooth_neighbor_expression:
+            neighbor_index = build_eight_neighbor_index(candidate_bin_ids, candidate_bin_xy_um)
+            expr = smooth_expression_by_eight_neighbors(expr, neighbor_index, include_self=True)
+        ll = compute_bin_log_likelihood_by_type(bin_counts=expr, theta=theta)
+    elif col_index is not None:
+        if expression_loader is None:
             raise ValueError(
-                f"artifact {artifact_path} must contain either candidate_expression or candidate_matrix_col_index"
+                f"artifact {locator.path} stores candidate_matrix_col_index but no matrix loader is available. "
+                "Ensure episodes_index.csv is from a run with config/config_resolved.yaml and reference format is npz."
             )
+        if smooth_neighbor_expression:
+            expr = expression_loader.load_columns(col_index)
+            neighbor_index = build_eight_neighbor_index(candidate_bin_ids, candidate_bin_xy_um)
+            expr = smooth_expression_by_eight_neighbors(expr, neighbor_index, include_self=True)
+            ll = compute_bin_log_likelihood_by_type(bin_counts=expr, theta=theta)
+        else:
+            ll = expression_loader.compute_ll_for_columns(col_index=col_index, log_theta=log_theta)
+    else:
+        raise ValueError(
+            f"artifact {locator.path} must contain either candidate_expression or candidate_matrix_col_index"
+        )
 
     if ll.ndim != 2:
         raise ValueError(f"precomputed ll in {artifact_path} must have shape (B, K)")
     if candidate_bin_xy_um.shape != (ll.shape[0], 2):
         raise ValueError(f"candidate_bin_xy_um in {artifact_path} must have shape (B, 2)")
-    if len(candidate_bin_ids) != ll.shape[0]:
+    if include_candidate_bin_ids and len(candidate_bin_ids) != ll.shape[0]:
         raise ValueError(f"candidate_bin_ids length mismatch in {artifact_path}")
     if nucleus_center_xy_um.shape != (2,):
         raise ValueError(f"nucleus_center_xy_um in {artifact_path} must have shape (2,)")
@@ -940,6 +1533,7 @@ def _load_one_episode_artifact(
     return PreparedEpisodeRewardData(
         cell_id=cell_id,
         candidate_bin_ids=candidate_bin_ids,
+        initial_membership_mask=np.zeros((ll.shape[0],), dtype=np.int8),
         candidate_bin_xy_um=candidate_bin_xy_um,
         nucleus_center_xy_um=nucleus_center_xy_um,
         precomputed_ll=ll,
@@ -947,26 +1541,147 @@ def _load_one_episode_artifact(
     )
 
 
+def _parse_episode_artifact_locator(artifact_path: str | Path) -> EpisodeArtifactLocator:
+    raw = str(artifact_path)
+    if "::" in raw:
+        path_str, member_str = raw.rsplit("::", 1)
+        try:
+            member_index = int(member_str)
+        except ValueError as exc:
+            raise ValueError(f"invalid artifact locator member index in {raw!r}") from exc
+        return EpisodeArtifactLocator(
+            path=Path(path_str).expanduser().resolve(),
+            member_index=member_index,
+        )
+    return EpisodeArtifactLocator(
+        path=Path(raw).expanduser().resolve(),
+        member_index=None,
+    )
+
+
+def _load_legacy_episode_artifact_payload(
+    *,
+    artifact_path: Path,
+    include_candidate_bin_ids: bool,
+) -> tuple[tuple[str, ...], np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+    with np.load(artifact_path, allow_pickle=True) as data:
+        candidate_bin_ids: tuple[str, ...]
+        if include_candidate_bin_ids:
+            candidate_bin_ids = tuple(str(x) for x in np.asarray(data["candidate_bin_ids"], dtype=object).tolist())
+        else:
+            candidate_bin_ids = tuple()
+        candidate_bin_xy_um = np.asarray(data["candidate_bin_xy_um"], dtype=np.float64)
+        nucleus_center_xy_um = np.asarray(data["nucleus_center_xy_um"], dtype=np.float64)
+        candidate_expression = None
+        col_index = None
+        if "candidate_expression" in data:
+            candidate_expression = np.asarray(data["candidate_expression"], dtype=np.float64)
+        elif "candidate_matrix_col_index" in data:
+            col_index = np.asarray(data["candidate_matrix_col_index"], dtype=np.int64)
+    return candidate_bin_ids, candidate_bin_xy_um, nucleus_center_xy_um, candidate_expression, col_index
+
+
+def _load_sharded_episode_artifact_payload(
+    *,
+    locator: EpisodeArtifactLocator,
+    cell_id: str,
+    include_candidate_bin_ids: bool,
+) -> tuple[tuple[str, ...], np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+    shard = _open_episode_artifact_shard(locator.path)
+    member_index = int(locator.member_index)
+    n_members = int(shard["nucleus_center_xy_um"].shape[0])
+    if member_index < 0 or member_index >= n_members:
+        raise IndexError(
+            f"artifact locator member index {member_index} is outside shard range [0, {n_members}) for {locator.path}"
+        )
+
+    row_splits = np.asarray(shard["candidate_row_splits"], dtype=np.int64)
+    start = int(row_splits[member_index])
+    end = int(row_splits[member_index + 1])
+    candidate_bin_xy_um = np.asarray(shard["candidate_bin_xy_um"][start:end], dtype=np.float64)
+    nucleus_center_xy_um = np.asarray(shard["nucleus_center_xy_um"][member_index], dtype=np.float64)
+
+    candidate_bin_ids: tuple[str, ...]
+    candidate_ids_arr = shard.get("candidate_bin_ids")
+    if include_candidate_bin_ids and candidate_ids_arr is not None:
+        candidate_bin_ids = tuple(str(x) for x in np.asarray(candidate_ids_arr[start:end]).tolist())
+    elif include_candidate_bin_ids:
+        candidate_bin_ids = tuple(f"{cell_id}::bin::{i}" for i in range(end - start))
+    else:
+        candidate_bin_ids = tuple()
+
+    candidate_expression = None
+    if "candidate_expression" in shard:
+        candidate_expression = np.asarray(shard["candidate_expression"][start:end], dtype=np.float64)
+
+    col_index = None
+    if "candidate_matrix_col_index" in shard:
+        col_index = np.asarray(shard["candidate_matrix_col_index"][start:end], dtype=np.int64)
+
+    return candidate_bin_ids, candidate_bin_xy_um, nucleus_center_xy_um, candidate_expression, col_index
+
+
+def _open_episode_artifact_shard(shard_path: Path) -> dict[str, np.ndarray]:
+    key = str(shard_path)
+    cached = _ARTIFACT_SHARD_CACHE.get(key)
+    if cached is not None:
+        _ARTIFACT_SHARD_CACHE.move_to_end(key)
+        return cached
+
+    if not shard_path.is_dir():
+        raise FileNotFoundError(f"episode artifact shard directory not found: {shard_path}")
+
+    required = {
+        "nucleus_center_xy_um": "nucleus_center_xy_um.npy",
+        "candidate_row_splits": "candidate_row_splits.npy",
+        "candidate_bin_xy_um": "candidate_bin_xy_um.npy",
+    }
+    optional = {
+        "candidate_bin_ids": "candidate_bin_ids.npy",
+        "candidate_expression": "candidate_expression.npy",
+        "candidate_matrix_col_index": "candidate_matrix_col_index.npy",
+    }
+
+    shard: dict[str, np.ndarray] = {}
+    for name, filename in required.items():
+        file_path = shard_path / filename
+        if not file_path.exists():
+            raise FileNotFoundError(f"artifact shard is missing required array: {file_path}")
+        shard[name] = np.load(file_path, mmap_mode="r", allow_pickle=False)
+
+    for name, filename in optional.items():
+        file_path = shard_path / filename
+        if file_path.exists():
+            shard[name] = np.load(file_path, mmap_mode="r", allow_pickle=False)
+
+    _ARTIFACT_SHARD_CACHE[key] = shard
+    _ARTIFACT_SHARD_CACHE.move_to_end(key)
+    while len(_ARTIFACT_SHARD_CACHE) > _ARTIFACT_SHARD_CACHE_SIZE:
+        _ARTIFACT_SHARD_CACHE.popitem(last=False)
+    return shard
+
+
 class _MatrixOnDemandExpressionLoader:
     """Load selected-gene expression vectors for matrix column indices from 10x H5."""
 
     def __init__(
         self,
-        matrix_h5_path: Path,
+        matrix_path: Path,
         reference_npz_path: Path,
         reference_genes_key: str,
         cache_size: int = 20000,
     ) -> None:
-        if not matrix_h5_path.exists():
-            raise FileNotFoundError(f"matrix H5 file not found: {matrix_h5_path}")
+        if not matrix_path.exists():
+            raise FileNotFoundError(f"matrix source not found: {matrix_path}")
         if not reference_npz_path.exists():
             raise FileNotFoundError(f"reference NPZ file not found: {reference_npz_path}")
         if cache_size < 0:
             raise ValueError("cache_size must be >= 0")
 
-        self._h5 = h5py.File(matrix_h5_path, "r")
+        resolved_matrix_h5_path = resolve_matrix_csc_h5_path(matrix_path)
+        self._h5 = h5py.File(resolved_matrix_h5_path, "r")
         if "matrix" not in self._h5:
-            raise ValueError(f"H5 file does not contain 'matrix' group: {matrix_h5_path}")
+            raise ValueError(f"H5 file does not contain 'matrix' group: {resolved_matrix_h5_path}")
         mg = self._h5["matrix"]
         for key in ("data", "indices", "indptr", "shape", "features"):
             if key not in mg:
@@ -977,7 +1692,7 @@ class _MatrixOnDemandExpressionLoader:
 
         shape = tuple(int(v) for v in mg["shape"][:].tolist())
         if len(shape) != 2:
-            raise ValueError(f"matrix/shape in {matrix_h5_path} is invalid: {shape}")
+            raise ValueError(f"matrix/shape in {resolved_matrix_h5_path} is invalid: {shape}")
         n_features, n_cols = int(shape[0]), int(shape[1])
         feature_names = np.asarray([x.decode("utf-8") for x in fg["name"][:]], dtype="U")
         selected_feature_indices = _resolve_matrix_feature_indices_from_reference(
@@ -1152,12 +1867,14 @@ def _load_episode_build_expression_context(
         return None
     if str(expression.get("mode", "")).strip() != "matrix_h5":
         return None
-    matrix_value = expression.get("matrix_h5_path", None)
+    matrix_value = expression.get("matrix_path", expression.get("matrix_h5_path", None))
     if matrix_value is None:
         return None
+    bins_value = inputs.get("bins_path")
     return {
-        "matrix_h5_path": Path(str(matrix_value)).expanduser().resolve(),
+        "matrix_path": Path(str(matrix_value)).expanduser().resolve(),
         "cache_size": int(expression.get("cache_size", 20000)),
+        "bins_path": None if bins_value is None else Path(str(bins_value)).expanduser().resolve(),
     }
 
 
@@ -1208,6 +1925,15 @@ def _load_axis(value: Any, name: str) -> GridAxis:
         stop=float(_require(mapping, "stop", name)),
         step=float(_require(mapping, "step", name)),
     )
+
+
+def _validate_axis_bounds(axis: GridAxis, name: str, *, allow_zero: bool) -> None:
+    if allow_zero:
+        if axis.start < 0 or axis.stop < 0:
+            raise ConfigError(f"{name} values must be >= 0")
+        return
+    if axis.start <= 0 or axis.stop <= 0:
+        raise ConfigError(f"{name} values must be > 0")
 
 
 def _axis_to_dict(axis: GridAxis) -> dict[str, float]:
@@ -1264,8 +1990,11 @@ def _load_table(path: Path, table_format: str) -> pd.DataFrame:
 
 
 def _build_metadata(run_dir: Path, seed: int | None) -> dict[str, Any]:
+    now_utc, now_local = _now_utc_and_local()
     return {
-        "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "timestamp_utc": now_utc.isoformat(),
+        "timestamp_local": now_local.isoformat(),
+        "local_timezone": _LOCAL_TIMEZONE_NAME,
         "run_dir": str(run_dir),
         "seed": seed,
         "python_version": sys.version,
@@ -1300,14 +2029,22 @@ def _write_yaml(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _append_step_log(path: Path, event: str, payload: dict[str, Any]) -> None:
+    now_utc, now_local = _now_utc_and_local()
     entry = {
-        "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "timestamp_utc": now_utc.isoformat(),
+        "timestamp_local": now_local.isoformat(),
         "event": event,
         "payload": payload,
     }
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, sort_keys=False))
         handle.write("\n")
+
+
+def _now_utc_and_local() -> tuple[dt.datetime, dt.datetime]:
+    """Return current UTC and America/Chicago timestamps."""
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    return now_utc, now_utc.astimezone(_LOCAL_TIMEZONE)
 
 
 def _slugify(text: str) -> str:

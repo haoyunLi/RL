@@ -22,6 +22,19 @@ from .reward_grid_search import (
 )
 from .state import CellAssignmentState
 
+try:
+    from .ppo_training import (
+        ActorCritic,
+        PPOTrainingConfig,
+        run_ppo_training,
+        run_ppo_training_from_config,
+    )
+    _HAS_PPO = True
+except ModuleNotFoundError as exc:
+    if exc.name != "torch":
+        raise
+    _HAS_PPO = False
+
 __all__ = [
     "Action",
     "ActionType",
@@ -48,3 +61,13 @@ __all__ = [
     "compute_bin_log_likelihood_by_type",
     "compute_reference_distribution",
 ]
+
+if _HAS_PPO:
+    __all__.extend(
+        [
+            "PPOTrainingConfig",
+            "ActorCritic",
+            "run_ppo_training",
+            "run_ppo_training_from_config",
+        ]
+    )

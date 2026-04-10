@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+*.codex
 .pytest_cache/
 
 # Experiment and run artifacts
@@ -21,3 +22,4 @@ Bin2Cell_Validation/
 # Local input/test data
 Human_Colorectal/
 colorectal_sc_data/
+colorectal_pseudo_visium_hd_output_full_0.25/

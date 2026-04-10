@@ -39,7 +39,7 @@ def main():
 
     # Output path for the cropped image. Keep generated preprocessing artifacts
     # under the reusable intermediate directory rather than mixing them into repo root.
-    output_path = 'workspace_outputs/human_colorectal/intermediate/cropped_visium_hd_human_Colorectal.png'
+    output_path = 'workspace_outputs/pseudo_human_colorectal/intermediate/cropped_visium_hd_human_Colorectal.png'
 
     # Image format: 'HE' for H&E staining, 'DAPI' for fluorescence
     image_format = 'HE'

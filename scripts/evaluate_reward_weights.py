@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Evaluate one fixed (w1, w2, w3, stop_lambda) setting on a chosen episodes index."""
+"""Evaluate one fixed (w1, w2, w3, w4, stop_lambda) setting on a chosen episodes index."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--w1", type=float, required=True)
     parser.add_argument("--w2", type=float, required=True)
     parser.add_argument("--w3", type=float, required=True)
+    parser.add_argument("--w4", type=float, default=None)
     parser.add_argument("--stop-lambda", type=float, required=True)
     parser.add_argument("--run-name", type=str, default="reward_weights_eval")
     parser.add_argument("--max-episodes", type=int, default=None, help="Optional cap for faster validation")
@@ -38,7 +39,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _build_arg_parser().parse_args()
     if args.w1 <= 0 or args.w2 <= 0 or args.w3 <= 0 or args.stop_lambda <= 0:
-        raise ValueError("weights must be > 0")
+        raise ValueError("w1, w2, w3, and stop-lambda must be > 0")
+    if args.w4 is not None and args.w4 < 0:
+        raise ValueError("w4 must be >= 0")
     if args.n_workers <= 0:
         raise ValueError("--n-workers must be > 0")
     if args.max_episodes is not None and args.max_episodes <= 0:
@@ -72,10 +75,19 @@ def main() -> None:
         r_max_um=base.r_max_um,
         normalize_expression_zscore=base.normalize_expression_zscore,
         zscore_delta=base.zscore_delta,
+        w4=base.w4 if args.w4 is None else float(args.w4),
+        stop_stat=base.stop_stat,
+        stop_top_k=base.stop_top_k,
         w1_axis=GridAxis(start=float(args.w1), stop=float(args.w1), step=1.0),
         w2_axis=GridAxis(start=float(args.w2), stop=float(args.w2), step=1.0),
         w3_axis=GridAxis(start=float(args.w3), stop=float(args.w3), step=1.0),
+        w4_axis=GridAxis(
+            start=base.w4 if args.w4 is None else float(args.w4),
+            stop=base.w4 if args.w4 is None else float(args.w4),
+            step=1.0,
+        ),
         stop_lambda_axis=GridAxis(start=float(args.stop_lambda), stop=float(args.stop_lambda), step=1.0),
+        supervised=base.supervised,
     )
 
     run_dir = run_reward_grid_search(config)

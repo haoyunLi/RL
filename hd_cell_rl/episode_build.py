@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import h5py
 import numpy as np
@@ -22,6 +23,7 @@ import yaml
 
 from .builder import build_episodes
 from .config import EnvironmentConfig
+from .matrix_io import resolve_matrix_csc_h5_path
 from .models import BinRecord, NucleusRecord
 
 
@@ -30,6 +32,8 @@ class ConfigError(ValueError):
 
 
 _MATRIX_CHUNK_WORKER_CONTEXT: dict[str, Any] | None = None
+_LOCAL_TIMEZONE = ZoneInfo("America/Chicago")
+_LOCAL_TIMEZONE_NAME = "America/Chicago"
 
 
 @dataclass(frozen=True)
@@ -52,10 +56,13 @@ class EpisodeBuildConfig:
     expression_matrix_col_index_column: str
     expression_reference_npz_path: Path | None
     expression_reference_genes_key: str
+    expression_filter_empty_nuclear_cells: bool
+    expression_min_nuclear_expression_sum: float
     expression_nuclei_chunk_size: int
     expression_cache_size: int
     expression_n_workers: int
     expression_save_compressed: bool
+    expression_artifact_layout: str
     env_config: EnvironmentConfig
 
     def to_serializable_dict(self) -> dict[str, Any]:
@@ -77,14 +84,18 @@ class EpisodeBuildConfig:
                     "mode": self.expression_mode,
                     "prefix": self.expression_prefix,
                     "columns": list(self.expression_columns),
+                    "matrix_path": None if self.expression_matrix_h5_path is None else str(self.expression_matrix_h5_path),
                     "matrix_h5_path": None if self.expression_matrix_h5_path is None else str(self.expression_matrix_h5_path),
                     "matrix_col_index_column": self.expression_matrix_col_index_column,
                     "reference_npz_path": None if self.expression_reference_npz_path is None else str(self.expression_reference_npz_path),
                     "reference_genes_key": self.expression_reference_genes_key,
+                    "filter_empty_nuclear_cells": self.expression_filter_empty_nuclear_cells,
+                    "min_nuclear_expression_sum": self.expression_min_nuclear_expression_sum,
                     "nuclei_chunk_size": self.expression_nuclei_chunk_size,
                     "cache_size": self.expression_cache_size,
                     "n_workers": self.expression_n_workers,
                     "save_compressed": self.expression_save_compressed,
+                    "artifact_layout": self.expression_artifact_layout,
                 },
             },
             "environment": {
@@ -135,14 +146,17 @@ def load_episode_build_config(config_path: str | Path) -> EpisodeBuildConfig:
     expression_mode = str(expression_cfg.get("mode", "prefix"))
     expression_prefix = expression_cfg.get("prefix")
     expression_columns_raw = expression_cfg.get("columns", [])
-    expression_matrix_h5_path_raw = expression_cfg.get("matrix_h5_path")
+    expression_matrix_h5_path_raw = expression_cfg.get("matrix_path", expression_cfg.get("matrix_h5_path"))
     expression_matrix_col_index_column = str(expression_cfg.get("matrix_col_index_column", "matrix_col_index"))
     expression_reference_npz_path_raw = expression_cfg.get("reference_npz_path")
     expression_reference_genes_key = str(expression_cfg.get("reference_genes_key", "genes"))
+    expression_filter_empty_nuclear_cells = bool(expression_cfg.get("filter_empty_nuclear_cells", False))
+    expression_min_nuclear_expression_sum = float(expression_cfg.get("min_nuclear_expression_sum", 0.0))
     expression_nuclei_chunk_size_raw = expression_cfg.get("nuclei_chunk_size", 512)
     expression_cache_size_raw = expression_cfg.get("cache_size", 20000)
     expression_n_workers_raw = expression_cfg.get("n_workers", 1)
     expression_save_compressed_raw = expression_cfg.get("save_compressed", True)
+    expression_artifact_layout_raw = expression_cfg.get("artifact_layout")
 
     if expression_columns_raw is None:
         expression_columns_raw = []
@@ -164,9 +178,15 @@ def load_episode_build_config(config_path: str | Path) -> EpisodeBuildConfig:
     expression_cache_size = int(expression_cache_size_raw)
     expression_n_workers = int(expression_n_workers_raw)
     expression_save_compressed = bool(expression_save_compressed_raw)
+    if expression_artifact_layout_raw is None:
+        expression_artifact_layout = "sharded_npy" if expression_mode == "matrix_h5" else "single_npz"
+    else:
+        expression_artifact_layout = str(expression_artifact_layout_raw).strip().lower()
 
     if expression_mode not in {"prefix", "list", "matrix_h5"}:
         raise ConfigError("inputs.expression.mode must be 'prefix', 'list', or 'matrix_h5'")
+    if expression_artifact_layout not in {"single_npz", "sharded_npy"}:
+        raise ConfigError("inputs.expression.artifact_layout must be 'single_npz' or 'sharded_npy'")
 
     if expression_mode == "prefix":
         if expression_prefix is None or not str(expression_prefix):
@@ -175,15 +195,19 @@ def load_episode_build_config(config_path: str | Path) -> EpisodeBuildConfig:
     elif expression_mode == "matrix_h5":
         expression_prefix = None
         if expression_matrix_h5_path is None:
-            raise ConfigError("inputs.expression.matrix_h5_path must be set when mode='matrix_h5'")
+            raise ConfigError("inputs.expression.matrix_path must be set when mode='matrix_h5'")
         if not expression_matrix_col_index_column:
             raise ConfigError("inputs.expression.matrix_col_index_column must be non-empty when mode='matrix_h5'")
+        if expression_min_nuclear_expression_sum < 0:
+            raise ConfigError("inputs.expression.min_nuclear_expression_sum must be >= 0")
         if expression_nuclei_chunk_size <= 0:
             raise ConfigError("inputs.expression.nuclei_chunk_size must be > 0")
         if expression_cache_size < 0:
             raise ConfigError("inputs.expression.cache_size must be >= 0")
         if expression_n_workers <= 0:
             raise ConfigError("inputs.expression.n_workers must be > 0")
+    elif expression_filter_empty_nuclear_cells:
+        raise ConfigError("inputs.expression.filter_empty_nuclear_cells is only supported when mode='matrix_h5'")
 
     max_center_distance_um = float(environment.get("max_center_distance_um", 80.0))
     radius_band_um_raw = environment.get("radius_band_um", 80.0)
@@ -221,10 +245,13 @@ def load_episode_build_config(config_path: str | Path) -> EpisodeBuildConfig:
         expression_matrix_col_index_column=expression_matrix_col_index_column,
         expression_reference_npz_path=expression_reference_npz_path,
         expression_reference_genes_key=expression_reference_genes_key,
+        expression_filter_empty_nuclear_cells=expression_filter_empty_nuclear_cells,
+        expression_min_nuclear_expression_sum=expression_min_nuclear_expression_sum,
         expression_nuclei_chunk_size=expression_nuclei_chunk_size,
         expression_cache_size=expression_cache_size,
         expression_n_workers=expression_n_workers,
         expression_save_compressed=expression_save_compressed,
+        expression_artifact_layout=expression_artifact_layout,
         env_config=env_config,
     )
 
@@ -271,6 +298,15 @@ def run_episode_build(
                 config.bin_columns["x_um"],
                 config.bin_columns["y_um"],
                 config.expression_matrix_col_index_column,
+                *(
+                    [
+                        "has_nuclear_annotation",
+                        "dominant_cell_id",
+                        "ambiguous_nuclear_assignment",
+                    ]
+                    if config.expression_filter_empty_nuclear_cells
+                    else []
+                ),
             ]
         )
     elif config.expression_mode == "list":
@@ -313,8 +349,9 @@ def run_episode_build(
     _append_step_log(steps_log_path, event="schema_validated", payload={})
 
     nuclei_records = _build_nucleus_records(nuclei_df, config.nuclei_columns)
+    empty_nuclear_filter_summary: dict[str, Any] | None = None
     if config.expression_mode == "matrix_h5":
-        episode_index, expression_dim = _build_and_save_episodes_matrix_backed(
+        episode_index, expression_dim, empty_nuclear_filter_summary = _build_and_save_episodes_matrix_backed(
             nuclei_records=nuclei_records,
             bins_df=bins_df,
             bin_columns=config.bin_columns,
@@ -323,10 +360,13 @@ def run_episode_build(
             matrix_col_index_column=config.expression_matrix_col_index_column,
             reference_npz_path=config.expression_reference_npz_path,
             reference_genes_key=config.expression_reference_genes_key,
+            filter_empty_nuclear_cells=config.expression_filter_empty_nuclear_cells,
+            min_nuclear_expression_sum=config.expression_min_nuclear_expression_sum,
             nuclei_chunk_size=config.expression_nuclei_chunk_size,
             expression_cache_size=config.expression_cache_size,
             n_workers=config.expression_n_workers,
             save_compressed=config.expression_save_compressed,
+            artifact_layout=config.expression_artifact_layout,
             states_dir=states_dir,
             index_chunks_dir=index_chunks_dir,
             steps_log_path=steps_log_path,
@@ -370,6 +410,7 @@ def run_episode_build(
         n_input_bins=len(bins_df),
         expression_dim=expression_dim,
         episode_index=episode_index,
+        empty_nuclear_filter_summary=empty_nuclear_filter_summary,
     )
 
     _write_yaml(config_dir / "config_resolved.yaml", _merge_config_with_resolved_columns(config, resolved_expression_columns))
@@ -501,6 +542,26 @@ def _dedupe_keep_order(items: list[str]) -> list[str]:
         seen.add(item)
         out.append(item)
     return out
+
+
+def _normalize_cell_id(value: Any) -> str | None:
+    """Normalize mixed int/float/string cell IDs into one stable string form."""
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, (np.integer, int)):
+        return str(int(value))
+    if isinstance(value, (np.floating, float)):
+        if not np.isfinite(value):
+            return None
+        if float(value).is_integer():
+            return str(int(value))
+        return str(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    if re.fullmatch(r"[+-]?\d+\.0+", text):
+        return text.split(".", 1)[0]
+    return text
 
 
 def _resolve_expression_columns(
@@ -675,19 +736,22 @@ def _build_and_save_episodes_matrix_backed(
     matrix_col_index_column: str,
     reference_npz_path: Path | None,
     reference_genes_key: str,
+    filter_empty_nuclear_cells: bool,
+    min_nuclear_expression_sum: float,
     nuclei_chunk_size: int,
     expression_cache_size: int,
     n_workers: int,
     save_compressed: bool,
+    artifact_layout: str,
     states_dir: Path,
     index_chunks_dir: Path,
     steps_log_path: Path,
-) -> tuple[list[dict[str, Any]], int]:
-    """Build and save episodes by loading expression vectors from 10x H5 via matrix_col_index."""
+) -> tuple[list[dict[str, Any]], int, dict[str, Any] | None]:
+    """Build and save episodes by loading expression vectors from 10x matrix source via matrix_col_index."""
     if matrix_h5_path is None:
-        raise ConfigError("matrix_h5_path must be set for matrix_h5 expression mode")
+        raise ConfigError("matrix_path must be set for matrix_h5 expression mode")
     if not matrix_h5_path.exists():
-        raise FileNotFoundError(f"matrix H5 file not found: {matrix_h5_path}")
+        raise FileNotFoundError(f"matrix source not found: {matrix_h5_path}")
     if matrix_col_index_column not in bins_df.columns:
         raise ValueError(
             f"bins table missing matrix col index column {matrix_col_index_column!r} "
@@ -708,9 +772,11 @@ def _build_and_save_episodes_matrix_backed(
     selected_feature_indices: np.ndarray
     n_features: int
     n_cols: int
-    with h5py.File(matrix_h5_path, "r") as h5:
+    resolved_matrix_h5_path = resolve_matrix_csc_h5_path(matrix_h5_path)
+    empty_nuclear_filter_summary: dict[str, Any] | None = None
+    with h5py.File(resolved_matrix_h5_path, "r") as h5:
         if "matrix" not in h5:
-            raise ValueError(f"H5 file does not contain 'matrix' group: {matrix_h5_path}")
+            raise ValueError(f"H5 file does not contain 'matrix' group: {resolved_matrix_h5_path}")
         mg = h5["matrix"]
         for key in ("data", "indices", "indptr", "shape", "features"):
             if key not in mg:
@@ -721,7 +787,7 @@ def _build_and_save_episodes_matrix_backed(
 
         shape = tuple(int(v) for v in mg["shape"][:].tolist())
         if len(shape) != 2:
-            raise ValueError(f"matrix/shape in {matrix_h5_path} is invalid: {shape}")
+            raise ValueError(f"matrix/shape in {resolved_matrix_h5_path} is invalid: {shape}")
         n_features, n_cols = int(shape[0]), int(shape[1])
         if (matrix_col_index >= n_cols).any():
             bad = int(matrix_col_index[matrix_col_index >= n_cols][0])
@@ -740,19 +806,41 @@ def _build_and_save_episodes_matrix_backed(
         if selected_feature_indices.max() >= n_features:
             raise ValueError("selected feature index exceeds matrix row count")
 
+        if filter_empty_nuclear_cells:
+            feature_lookup = np.full(n_features, -1, dtype=np.int32)
+            feature_lookup[selected_feature_indices] = np.arange(selected_feature_indices.size, dtype=np.int32)
+            nuclei_records, filter_summary = _filter_nuclei_records_by_nuclear_expression(
+                nuclei_records=nuclei_records,
+                bins_df=bins_df,
+                matrix_col_index_column=matrix_col_index_column,
+                data_ds=mg["data"],
+                indices_ds=mg["indices"],
+                indptr=np.asarray(mg["indptr"][:], dtype=np.int64),
+                feature_lookup=feature_lookup,
+                min_nuclear_expression_sum=min_nuclear_expression_sum,
+            )
+            empty_nuclear_filter_summary = dict(filter_summary)
+            _append_step_log(
+                steps_log_path,
+                event="empty_nuclear_expression_filter_applied",
+                payload=filter_summary,
+            )
+
     expression_dim = int(selected_feature_indices.size)
     _append_step_log(
         steps_log_path,
         event="expression_columns_resolved",
         payload={
             "expression_dim": expression_dim,
-            "matrix_h5_path": str(matrix_h5_path),
+            "matrix_path": str(matrix_h5_path),
+            "resolved_matrix_h5_path": str(resolved_matrix_h5_path),
             "n_matrix_features": n_features,
             "n_matrix_barcodes": n_cols,
             "nuclei_chunk_size": int(nuclei_chunk_size),
             "expression_cache_size": int(expression_cache_size),
             "n_workers": int(n_workers),
             "save_compressed": bool(save_compressed),
+            "artifact_layout": str(artifact_layout),
         },
     )
 
@@ -772,6 +860,7 @@ def _build_and_save_episodes_matrix_backed(
         "states_dir": str(states_dir),
         "index_chunks_dir": str(index_chunks_dir),
         "save_compressed": bool(save_compressed),
+        "artifact_layout": str(artifact_layout),
     }
 
     global _MATRIX_CHUNK_WORKER_CONTEXT
@@ -856,7 +945,119 @@ def _build_and_save_episodes_matrix_backed(
         event="episodes_built",
         payload={"n_episodes": int(len(index_rows))},
     )
-    return index_rows, expression_dim
+    return index_rows, expression_dim, empty_nuclear_filter_summary
+
+
+def _filter_nuclei_records_by_nuclear_expression(
+    *,
+    nuclei_records: list[NucleusRecord],
+    bins_df: pd.DataFrame,
+    matrix_col_index_column: str,
+    data_ds: h5py.Dataset,
+    indices_ds: h5py.Dataset,
+    indptr: np.ndarray,
+    feature_lookup: np.ndarray,
+    min_nuclear_expression_sum: float,
+) -> tuple[list[NucleusRecord], dict[str, Any]]:
+    """Drop cells whose confident nuclear bins have zero selected-gene expression."""
+    required_cols = [
+        "has_nuclear_annotation",
+        "dominant_cell_id",
+        "ambiguous_nuclear_assignment",
+        matrix_col_index_column,
+    ]
+    missing = [col for col in required_cols if col not in bins_df.columns]
+    if missing:
+        raise ValueError(
+            "bins table is missing required columns for empty-nuclear filtering: "
+            f"{missing}"
+        )
+
+    work = bins_df.loc[
+        bins_df["has_nuclear_annotation"].fillna(False).astype(bool)
+        & ~bins_df["ambiguous_nuclear_assignment"].fillna(False).astype(bool),
+        ["dominant_cell_id", matrix_col_index_column],
+    ].copy()
+    if work.empty:
+        return [], {
+            "n_input_nuclei": int(len(nuclei_records)),
+            "n_kept_nuclei": 0,
+            "n_filtered_nuclei": int(len(nuclei_records)),
+            "n_cells_with_confident_nuclear_bins": 0,
+            "n_cells_with_positive_nuclear_expression": 0,
+            "min_nuclear_expression_sum": float(min_nuclear_expression_sum),
+        }
+
+    work["cell_id_norm"] = work["dominant_cell_id"].map(_normalize_cell_id)
+    work = work.loc[work["cell_id_norm"].notna()].copy()
+    if work.empty:
+        return [], {
+            "n_input_nuclei": int(len(nuclei_records)),
+            "n_kept_nuclei": 0,
+            "n_filtered_nuclei": int(len(nuclei_records)),
+            "n_cells_with_confident_nuclear_bins": 0,
+            "n_cells_with_positive_nuclear_expression": 0,
+            "min_nuclear_expression_sum": float(min_nuclear_expression_sum),
+        }
+
+    work[matrix_col_index_column] = pd.to_numeric(work[matrix_col_index_column], errors="raise").astype(np.int64)
+    nuclear_cols_by_cell: dict[str, np.ndarray] = {}
+    for cell_id_norm, group in work.groupby("cell_id_norm", sort=False):
+        nuclear_cols_by_cell[str(cell_id_norm)] = group[matrix_col_index_column].drop_duplicates().to_numpy(dtype=np.int64)
+
+    unique_cols = np.unique(np.concatenate(list(nuclear_cols_by_cell.values()), axis=0))
+    selected_sum_by_col: dict[int, float] = {}
+    for col_index in unique_cols.tolist():
+        selected_sum_by_col[int(col_index)] = _get_matrix_column_selected_sum(
+            col_index=int(col_index),
+            data_ds=data_ds,
+            indices_ds=indices_ds,
+            indptr=indptr,
+            feature_lookup=feature_lookup,
+        )
+
+    valid_cell_ids: set[str] = set()
+    for cell_id_norm, col_idx in nuclear_cols_by_cell.items():
+        total = float(sum(selected_sum_by_col.get(int(col), 0.0) for col in col_idx.tolist()))
+        if total > float(min_nuclear_expression_sum):
+            valid_cell_ids.add(str(cell_id_norm))
+
+    filtered_records = [
+        nucleus
+        for nucleus in nuclei_records
+        if (norm := _normalize_cell_id(nucleus.cell_id)) is not None and norm in valid_cell_ids
+    ]
+    return filtered_records, {
+        "n_input_nuclei": int(len(nuclei_records)),
+        "n_kept_nuclei": int(len(filtered_records)),
+        "n_filtered_nuclei": int(len(nuclei_records) - len(filtered_records)),
+        "n_cells_with_confident_nuclear_bins": int(len(nuclear_cols_by_cell)),
+        "n_cells_with_positive_nuclear_expression": int(len(valid_cell_ids)),
+        "min_nuclear_expression_sum": float(min_nuclear_expression_sum),
+    }
+
+
+def _get_matrix_column_selected_sum(
+    *,
+    col_index: int,
+    data_ds: h5py.Dataset,
+    indices_ds: h5py.Dataset,
+    indptr: np.ndarray,
+    feature_lookup: np.ndarray,
+) -> float:
+    """Return total selected-gene expression in one sparse matrix column."""
+    start = int(indptr[col_index])
+    end = int(indptr[col_index + 1])
+    if end <= start:
+        return 0.0
+
+    col_feature_idx = np.asarray(indices_ds[start:end], dtype=np.int64)
+    col_values = np.asarray(data_ds[start:end], dtype=np.float64)
+    selected_pos = feature_lookup[col_feature_idx]
+    keep = selected_pos >= 0
+    if not np.any(keep):
+        return 0.0
+    return float(np.sum(col_values[keep], dtype=np.float64))
 
 
 def _process_matrix_chunk_worker(
@@ -887,8 +1088,9 @@ def _process_matrix_chunk_worker(
     states_dir = Path(str(ctx["states_dir"]))
     index_chunks_dir = Path(str(ctx["index_chunks_dir"]))
     save_compressed = bool(ctx["save_compressed"])
+    artifact_layout = str(ctx.get("artifact_layout", "single_npz"))
 
-    rows: list[dict[str, Any]] = []
+    shard_records: list[dict[str, Any]] = []
     for offset, nucleus in enumerate(chunk_records):
         episode_index = chunk_start + offset
 
@@ -922,23 +1124,143 @@ def _process_matrix_chunk_worker(
             candidate_xy = np.column_stack((x_um[candidate_idx], y_um[candidate_idx])).astype(np.float32, copy=False)
             candidate_col_index = matrix_col_index[candidate_idx].astype(np.int64, copy=False)
 
-        rows.append(
+        shard_records.append(
+            {
+                "episode_index": int(episode_index),
+                "nucleus": nucleus,
+                "candidate_bin_ids": candidate_ids,
+                "candidate_bin_xy_um": candidate_xy,
+                "candidate_matrix_col_index": candidate_col_index,
+            }
+        )
+
+    if artifact_layout == "sharded_npy":
+        rows = _save_matrix_chunk_artifact_shard(
+            chunk_id=int(chunk_id),
+            shard_records=shard_records,
+            states_dir=states_dir,
+        )
+    else:
+        rows = [
             _save_one_episode_artifact(
-                episode_index=episode_index,
-                nucleus=nucleus,
-                candidate_bin_ids=candidate_ids,
-                candidate_bin_xy_um=candidate_xy,
+                episode_index=int(record["episode_index"]),
+                nucleus=record["nucleus"],
+                candidate_bin_ids=record["candidate_bin_ids"],
+                candidate_bin_xy_um=record["candidate_bin_xy_um"],
                 candidate_expression=None,
-                candidate_matrix_col_index=candidate_col_index,
+                candidate_matrix_col_index=record["candidate_matrix_col_index"],
                 states_dir=states_dir,
                 steps_log_path=None,
                 save_compressed=save_compressed,
             )
-        )
+            for record in shard_records
+        ]
 
     chunk_index_path = index_chunks_dir / f"chunk_{chunk_id:06d}.csv"
     pd.DataFrame(rows, columns=list(_episode_index_columns())).to_csv(chunk_index_path, index=False)
     return (int(chunk_id), int(chunk_start), int(chunk_end), str(chunk_index_path), int(len(rows)))
+
+
+def _save_matrix_chunk_artifact_shard(
+    *,
+    chunk_id: int,
+    shard_records: list[dict[str, Any]],
+    states_dir: Path,
+) -> list[dict[str, Any]]:
+    """Write one chunk of matrix-backed episodes into one shard directory."""
+    shard_dir = states_dir / f"shard_{int(chunk_id):06d}"
+    shard_dir.mkdir(parents=True, exist_ok=False)
+
+    n_rows = len(shard_records)
+    row_splits = np.zeros((n_rows + 1,), dtype=np.int64)
+    flat_candidate_xy: list[np.ndarray] = []
+    flat_candidate_ids: list[np.ndarray] = []
+    flat_matrix_col_index: list[np.ndarray] = []
+    cell_ids: list[str] = []
+    cell_types: list[str] = []
+    nucleus_center_xy = np.zeros((n_rows, 2), dtype=np.float32)
+    nucleus_radius = np.zeros((n_rows,), dtype=np.float32)
+
+    running = 0
+    for i, record in enumerate(shard_records):
+        nucleus = record["nucleus"]
+        candidate_ids = np.asarray(record["candidate_bin_ids"])
+        candidate_xy = np.asarray(record["candidate_bin_xy_um"], dtype=np.float32)
+        candidate_col_index = np.asarray(record["candidate_matrix_col_index"], dtype=np.int64)
+        n_bins = int(candidate_xy.shape[0])
+        if candidate_ids.shape[0] != n_bins or candidate_col_index.shape[0] != n_bins:
+            raise ValueError("shard record candidate arrays must share the same row count")
+
+        cell_ids.append(str(nucleus.cell_id))
+        cell_types.append(str(nucleus.cell_type))
+        nucleus_center_xy[i] = np.asarray([nucleus.center_x_um, nucleus.center_y_um], dtype=np.float32)
+        nucleus_radius[i] = np.float32(nucleus.radius_um)
+        flat_candidate_xy.append(candidate_xy)
+        flat_candidate_ids.append(_to_fixed_width_unicode_array(candidate_ids.tolist()))
+        flat_matrix_col_index.append(candidate_col_index)
+
+        running += n_bins
+        row_splits[i + 1] = running
+
+    flat_xy = (
+        np.concatenate(flat_candidate_xy, axis=0).astype(np.float32, copy=False)
+        if flat_candidate_xy and running > 0
+        else np.zeros((0, 2), dtype=np.float32)
+    )
+    flat_ids = (
+        _concat_unicode_arrays(flat_candidate_ids)
+        if flat_candidate_ids and running > 0
+        else np.asarray([], dtype="<U1")
+    )
+    flat_col_index = (
+        np.concatenate(flat_matrix_col_index, axis=0).astype(np.int64, copy=False)
+        if flat_matrix_col_index and running > 0
+        else np.zeros((0,), dtype=np.int64)
+    )
+
+    np.save(shard_dir / "cell_id.npy", _to_fixed_width_unicode_array(cell_ids), allow_pickle=False)
+    np.save(shard_dir / "cell_type.npy", _to_fixed_width_unicode_array(cell_types), allow_pickle=False)
+    np.save(shard_dir / "nucleus_center_xy_um.npy", nucleus_center_xy, allow_pickle=False)
+    np.save(shard_dir / "nucleus_radius_um.npy", nucleus_radius, allow_pickle=False)
+    np.save(shard_dir / "candidate_row_splits.npy", row_splits, allow_pickle=False)
+    np.save(shard_dir / "candidate_bin_xy_um.npy", flat_xy, allow_pickle=False)
+    np.save(shard_dir / "candidate_bin_ids.npy", flat_ids, allow_pickle=False)
+    np.save(shard_dir / "candidate_matrix_col_index.npy", flat_col_index, allow_pickle=False)
+
+    rows: list[dict[str, Any]] = []
+    for local_idx, record in enumerate(shard_records):
+        nucleus = record["nucleus"]
+        n_candidate_bins = int(np.asarray(record["candidate_matrix_col_index"]).shape[0])
+        rows.append(
+            {
+                "episode_index": int(record["episode_index"]),
+                "cell_id": nucleus.cell_id,
+                "cell_type": nucleus.cell_type,
+                "nucleus_center_x_um": nucleus.center_x_um,
+                "nucleus_center_y_um": nucleus.center_y_um,
+                "nucleus_radius_um": nucleus.radius_um,
+                "n_candidate_bins": n_candidate_bins,
+                "artifact_path": f"{shard_dir}::{local_idx}",
+            }
+        )
+    return rows
+
+
+def _to_fixed_width_unicode_array(values: list[str]) -> np.ndarray:
+    """Store string arrays in .npy without object dtype so they remain mmap-friendly."""
+    if not values:
+        return np.asarray([], dtype="<U1")
+    max_len = max(len(str(v)) for v in values)
+    return np.asarray([str(v) for v in values], dtype=f"<U{max(1, max_len)}")
+
+
+def _concat_unicode_arrays(arrays: list[np.ndarray]) -> np.ndarray:
+    """Concatenate fixed-width unicode arrays into one shared dtype."""
+    if not arrays:
+        return np.asarray([], dtype="<U1")
+    max_len = max(int(np.dtype(arr.dtype).itemsize // 4) for arr in arrays)
+    casted = [np.asarray(arr, dtype=f"<U{max(1, max_len)}") for arr in arrays]
+    return np.concatenate(casted, axis=0)
 
 
 def _get_matrix_column_selected_expression(
@@ -1150,6 +1472,7 @@ def _compute_summary(
     n_input_bins: int,
     expression_dim: int,
     episode_index: list[dict[str, Any]],
+    empty_nuclear_filter_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if episode_index:
         candidate_counts = np.asarray([int(row["n_candidate_bins"]) for row in episode_index], dtype=np.int64)
@@ -1172,6 +1495,11 @@ def _compute_summary(
         "candidate_bins_p90": float(np.percentile(candidate_counts, 90)) if len(candidate_counts) else 0.0,
         "candidate_bins_p99": float(np.percentile(candidate_counts, 99)) if len(candidate_counts) else 0.0,
     }
+    if empty_nuclear_filter_summary is not None:
+        summary["empty_nuclear_expression_filter"] = {
+            key: (int(value) if isinstance(value, (np.integer, int)) else float(value) if isinstance(value, (np.floating, float)) else value)
+            for key, value in empty_nuclear_filter_summary.items()
+        }
     return summary
 
 
@@ -1185,10 +1513,12 @@ def _merge_config_with_resolved_columns(
 
 
 def _build_metadata(config: EpisodeBuildConfig, run_dir: Path) -> dict[str, Any]:
-    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    now_utc, now_local = _now_utc_and_local()
 
     metadata = {
-        "timestamp_utc": now,
+        "timestamp_utc": now_utc.isoformat(),
+        "timestamp_local": now_local.isoformat(),
+        "local_timezone": _LOCAL_TIMEZONE_NAME,
         "run_dir": str(run_dir),
         "seed": config.seed,
         "python_version": sys.version,
@@ -1224,14 +1554,22 @@ def _write_yaml(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _append_step_log(path: Path, event: str, payload: dict[str, Any]) -> None:
+    now_utc, now_local = _now_utc_and_local()
     entry = {
-        "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "timestamp_utc": now_utc.isoformat(),
+        "timestamp_local": now_local.isoformat(),
         "event": event,
         "payload": payload,
     }
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, sort_keys=False))
         handle.write("\n")
+
+
+def _now_utc_and_local() -> tuple[dt.datetime, dt.datetime]:
+    """Return current UTC and America/Chicago timestamps."""
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    return now_utc, now_utc.astimezone(_LOCAL_TIMEZONE)
 
 
 def _slugify(text: str) -> str:

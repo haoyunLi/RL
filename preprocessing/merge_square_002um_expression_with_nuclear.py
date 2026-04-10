@@ -20,11 +20,18 @@ import gzip
 import json
 import logging
 from pathlib import Path
+import sys
 from typing import Any
 
-import h5py
 import numpy as np
 import pandas as pd
+
+# Ensure local package imports work when the script is executed directly.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from hd_cell_rl.matrix_io import load_matrix_barcodes_in_order, load_selected_feature_metadata
 
 
 LOGGER = logging.getLogger(__name__)
@@ -40,7 +47,7 @@ def configure_logging(verbose: bool = False) -> None:
 
 def build_square_002um_rl_metadata(
     nuclear_annotation_path: str | Path,
-    matrix_h5_path: str | Path,
+    matrix_path: str | Path,
     tissue_positions_parquet: str | Path,
     *,
     barcodes_tsv_path: str | Path | None = None,
@@ -53,8 +60,9 @@ def build_square_002um_rl_metadata(
     ----------
     nuclear_annotation_path:
         Official-barcode nuclear annotation CSV/CSV.GZ.
-    matrix_h5_path:
-        10x matrix H5. For all bins, use `raw_feature_bc_matrix.h5`.
+    matrix_path:
+        10x expression source. May be a `.h5` file or a 10x matrix directory
+        such as `filtered_feature_bc_matrix/`.
     tissue_positions_parquet:
         Official `spatial/tissue_positions.parquet` file with per-bin coordinates.
     barcodes_tsv_path:
@@ -78,12 +86,12 @@ def build_square_002um_rl_metadata(
         Plain-Python metadata about the aligned dataset.
     """
     nuclear_path = Path(nuclear_annotation_path)
-    matrix_path = Path(matrix_h5_path)
+    matrix_path = Path(matrix_path)
     tissue_path = Path(tissue_positions_parquet)
     if not nuclear_path.exists():
         raise FileNotFoundError(f"nuclear annotation file not found: {nuclear_path}")
     if not matrix_path.exists():
-        raise FileNotFoundError(f"matrix H5 file not found: {matrix_path}")
+        raise FileNotFoundError(f"matrix source not found: {matrix_path}")
     if not tissue_path.exists():
         raise FileNotFoundError(f"tissue positions file not found: {tissue_path}")
     if microns_per_pixel <= 0:
@@ -98,7 +106,7 @@ def build_square_002um_rl_metadata(
     tissue_df = _load_official_tissue_positions(tissue_path, microns_per_pixel=microns_per_pixel)
     LOGGER.info("Loaded %d official tissue-position rows", len(tissue_df))
 
-    matrix_barcodes_df = _load_matrix_barcodes_in_order(matrix_path, barcodes_tsv_path=barcodes_tsv_path)
+    matrix_barcodes_df = load_matrix_barcodes_in_order(matrix_path, barcodes_tsv_path=barcodes_tsv_path)
     LOGGER.info("Loaded %d matrix barcodes in official order", len(matrix_barcodes_df))
 
     metadata_df = matrix_barcodes_df.merge(tissue_df, on="barcode", how="left", validate="one_to_one")
@@ -118,13 +126,13 @@ def build_square_002um_rl_metadata(
         validate="many_to_one",
     )
 
-    selected_features_df, selected_feature_indices, feature_manifest = _load_selected_feature_metadata(
+    selected_features_df, selected_feature_indices, feature_manifest = load_selected_feature_metadata(
         matrix_path,
         feature_type_filter=feature_type_filter,
     )
 
     manifest = {
-        "matrix_h5_path": str(matrix_path.resolve()),
+        "matrix_path": str(matrix_path.resolve()),
         "barcodes_tsv_path": None if barcodes_tsv_path is None else str(Path(barcodes_tsv_path).resolve()),
         "tissue_positions_parquet": str(tissue_path.resolve()),
         "feature_type_filter": feature_type_filter,
@@ -267,69 +275,6 @@ def _load_official_tissue_positions(path: Path, *, microns_per_pixel: float) -> 
     return out
 
 
-def _load_matrix_barcodes_in_order(matrix_h5_path: Path, *, barcodes_tsv_path: str | Path | None) -> pd.DataFrame:
-    """Load official matrix barcodes in matrix-column order."""
-    if barcodes_tsv_path is None:
-        inferred = matrix_h5_path.parent / matrix_h5_path.stem.replace('.h5', '') / 'barcodes.tsv.gz'
-        # fallback for 10x layout where H5 sits beside a same-named folder is not reliable
-        # so just use the sibling folder named after the matrix stem if it exists.
-        if inferred.exists():
-            barcodes_tsv_path = inferred
-        else:
-            sibling = matrix_h5_path.parent / matrix_h5_path.name.replace('.h5', '') / 'barcodes.tsv.gz'
-            if sibling.exists():
-                barcodes_tsv_path = sibling
-
-    if barcodes_tsv_path is not None and Path(barcodes_tsv_path).exists():
-        barcodes_df = pd.read_csv(
-            barcodes_tsv_path,
-            sep="\t",
-            header=None,
-            names=["barcode"],
-            dtype={"barcode": "string"},
-        )
-        barcodes_df["barcode"] = barcodes_df["barcode"].astype(str)
-    else:
-        with h5py.File(matrix_h5_path, "r") as h5:
-            raw = h5["matrix/barcodes"][:]
-        barcodes_df = pd.DataFrame({"barcode": [x.decode("utf-8") for x in raw]})
-
-    barcodes_df["matrix_col_index"] = np.arange(len(barcodes_df), dtype=np.int64)
-    return barcodes_df
-
-
-def _load_selected_feature_metadata(
-    matrix_h5_path: Path,
-    *,
-    feature_type_filter: str | None,
-) -> tuple[pd.DataFrame, np.ndarray, dict[str, Any]]:
-    """Load feature metadata and compute selected row indices."""
-    with h5py.File(matrix_h5_path, "r") as h5:
-        feature_ids = np.asarray([x.decode("utf-8") for x in h5["matrix/features/id"][:]], dtype=object)
-        feature_names = np.asarray([x.decode("utf-8") for x in h5["matrix/features/name"][:]], dtype=object)
-        feature_types = np.asarray([x.decode("utf-8") for x in h5["matrix/features/feature_type"][:]], dtype=object)
-        genomes = np.asarray([x.decode("utf-8") for x in h5["matrix/features/genome"][:]], dtype=object)
-
-    if feature_type_filter is None:
-        selected = np.arange(len(feature_ids), dtype=np.int64)
-    else:
-        selected = np.flatnonzero(feature_types == str(feature_type_filter)).astype(np.int64)
-        if len(selected) == 0:
-            raise ValueError(f"feature_type_filter {feature_type_filter!r} matched zero features")
-
-    selected_features_df = pd.DataFrame(
-        {
-            "matrix_feature_index": selected,
-            "feature_id": feature_ids[selected],
-            "feature_name": feature_names[selected],
-            "feature_type": feature_types[selected],
-            "genome": genomes[selected],
-        }
-    )
-    manifest = {"n_total_features": int(len(feature_ids))}
-    return selected_features_df, selected, manifest
-
-
 def _fill_missing_nuclear_metadata(df: pd.DataFrame) -> pd.DataFrame:
     """Fill missing nuclear annotation columns for non-nuclear bins."""
     out = df.copy()
@@ -396,7 +341,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     """Build CLI argument parser."""
     parser = argparse.ArgumentParser(description="Build all-bin square_002um RL metadata from official expression + nuclear annotations")
     parser.add_argument("--nuclear-annotation-path", required=True, help="Path to barcode-aligned nuclear annotation CSV/CSV.GZ")
-    parser.add_argument("--matrix-h5-path", required=True, help="Path to raw_feature_bc_matrix.h5 or filtered_feature_bc_matrix.h5")
+    parser.add_argument(
+        "--matrix-path",
+        default=None,
+        help="Path to a 10x matrix source: `.h5` file or matrix directory such as filtered_feature_bc_matrix/",
+    )
+    parser.add_argument(
+        "--matrix-h5-path",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--tissue-positions-parquet", required=True, help="Path to spatial/tissue_positions.parquet")
     parser.add_argument("--output-dir", required=True, help="Directory for merged outputs")
     parser.add_argument("--prefix", default="square_002um_rl", help="Output file prefix")
@@ -412,9 +366,13 @@ def main() -> None:
     args = _build_arg_parser().parse_args()
     configure_logging(verbose=args.verbose)
 
+    matrix_path = args.matrix_path if args.matrix_path is not None else args.matrix_h5_path
+    if matrix_path is None:
+        parser.error("one of --matrix-path or --matrix-h5-path is required")
+
     metadata_df, claims_df, selected_features_df, selected_feature_indices, manifest = build_square_002um_rl_metadata(
         nuclear_annotation_path=args.nuclear_annotation_path,
-        matrix_h5_path=args.matrix_h5_path,
+        matrix_path=matrix_path,
         tissue_positions_parquet=args.tissue_positions_parquet,
         barcodes_tsv_path=args.barcodes_tsv_path,
         microns_per_pixel=args.microns_per_pixel,

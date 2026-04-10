@@ -109,6 +109,8 @@ def _assert_reusable_context(coarse: RewardGridSearchConfig, fine: RewardGridSea
         ("nuclei_path", coarse.nuclei_path, fine.nuclei_path),
         ("epsilon", coarse.epsilon, fine.epsilon),
         ("max_episodes", coarse.max_episodes, fine.max_episodes),
+        ("objective", coarse.objective, fine.objective),
+        ("supervised", coarse.supervised, fine.supervised),
     )
     for name, left, right in checks:
         if left != right:
@@ -145,7 +147,7 @@ def main() -> None:
     coarse_search = coarse_cfg.setdefault("search", {})
     if not isinstance(coarse_search, dict):
         raise ValueError("search section must be a mapping")
-    for axis_name in ("w1", "w2", "w3", "stop_lambda"):
+    for axis_name in ("w1", "w2", "w3", "w4", "stop_lambda"):
         axis = coarse_search.get(axis_name)
         if not isinstance(axis, dict):
             raise ValueError(f"missing search axis in config: {axis_name}")
@@ -177,7 +179,7 @@ def main() -> None:
         if not isinstance(search_cfg, dict):
             raise ValueError("search section must be a mapping")
 
-        for axis_name in ("w1", "w2", "w3", "stop_lambda"):
+        for axis_name in ("w1", "w2", "w3", "w4", "stop_lambda"):
             if axis_name not in search_cfg or not isinstance(search_cfg[axis_name], dict):
                 raise ValueError(f"missing search axis in config: {axis_name}")
             center = _axis_value(best, axis_name)
@@ -210,6 +212,7 @@ def main() -> None:
             "w1": best["w1"],
             "w2": best["w2"],
             "w3": best["w3"],
+            "w4": best["w4"],
             "stop_lambda": best["stop_lambda"],
             "objective_value": best["objective_value"],
         },

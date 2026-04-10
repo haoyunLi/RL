@@ -21,5 +21,5 @@ source /sw/apps/anaconda3/2024.10/etc/profile.d/conda.sh
 conda activate $WORK_DIR/Bin2Cell_Validation
 
 # Run the Python script
-mkdir -p workspace_outputs/human_colorectal/intermediate
+mkdir -p workspace_outputs/pseudo_human_colorectal/intermediate
 python3 preprocessing/crop_visium_hd_script.py

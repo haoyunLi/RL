@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Select reward weights by behavior filters first, then mean_return ranking."""
+"""Select reward weights by behavior filters first, then objective_value ranking."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Filter reward-grid results by behavior constraints first, "
-            "then rank by mean_return."
+            "then rank by objective_value when available."
         )
     )
     parser.add_argument(
@@ -169,7 +169,8 @@ def main() -> None:
         max_stop_reward=None if args.max_stop_reward is None else float(args.max_stop_reward),
     )
 
-    filtered = filtered.sort_values("mean_return", ascending=False).reset_index(drop=True)
+    sort_col = "objective_value" if "objective_value" in filtered.columns else "mean_return"
+    filtered = filtered.sort_values(sort_col, ascending=False).reset_index(drop=True)
     top = filtered.head(int(args.top_k)).copy()
 
     top_csv = out_dir / "top_filtered_results.csv"
@@ -197,8 +198,11 @@ def main() -> None:
             "w1": float(best["w1"]),
             "w2": float(best["w2"]),
             "w3": float(best["w3"]),
+            "w4": float(best["w4"]) if "w4" in best.index else 0.0,
             "stop_lambda": float(best["stop_lambda"]),
             "mean_return": float(best["mean_return"]),
+            "objective": None if "objective" not in best.index else str(best["objective"]),
+            "objective_value": None if "objective_value" not in best.index else float(best["objective_value"]),
             "mean_assigned_bins": float(best["mean_assigned_bins"]),
             "mean_add_actions": float(best["mean_add_actions"]),
             "mean_stop_reward": float(best["mean_stop_reward"]),
@@ -228,4 +232,3 @@ if __name__ == "__main__":
     except Exception as exc:  # pragma: no cover - CLI failure path
         print(f"ERROR: {exc}", file=sys.stderr)
         raise
-

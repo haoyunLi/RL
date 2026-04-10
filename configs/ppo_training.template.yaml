@@ -1,0 +1,70 @@
+run:
+  name: human_colorectal_ppo
+  output_root: runs
+  seed: 7
+  device: auto
+  batch_cells: 200
+  # Rollout mode:
+  # - vectorized: one batched forward across active envs each step (recommended)
+  # - legacy: per-env threaded rollout
+  rollout_mode: vectorized
+  # Used only by rollout_mode=legacy.
+  n_rollout_workers: 32
+  max_updates: 600
+  max_steps_per_episode: null
+
+inputs:
+  # This is auto-updated by jobs/run_ppo_training_cpu.sbatch and jobs/run_ppo_training_gpu.sbatch.
+  episodes_index_path: runs/example_episode_build_run/episodes_index.csv
+  reference:
+    path: workspace_outputs/pseudo_human_colorectal/intermediate/reference_sct/reference_counts_sct_tumor_aligned_hd_overlap_unique.npz
+    format: npz
+    array_key: reference_counts
+    genes_key: genes
+  nuclei:
+    path: workspace_outputs/pseudo_human_colorectal/intermediate/human_colorectal_nuclei.parquet
+    format: auto
+    columns:
+      cell_id: cell_id
+      center_x_um: center_x_um
+      center_y_um: center_y_um
+  # Optional override for matrix-column expression loader cache.
+  # If null, value from episodes run config is reused.
+  expression_cache_size: null
+  # Smooth each candidate bin by averaging with its available 8-neighbors at episode-load time.
+  # This does not require rebuilding episode artifacts.
+  expression_neighbor_smoothing: true
+
+ppo:
+  gamma: 0.99
+  normalize_returns_per_episode: true
+  normalize_advantages: true
+  eps_clip: 0.2
+  ppo_epochs: 4
+  minibatch_size: 1024
+  learning_rate: 3.0e-4
+  weight_decay: 0.0
+  vf_coef: 0.5
+  ent_coef: 0.01
+  max_grad_norm: 1.0
+  hidden_dim: 128
+  # Optional KL guardrail for PPO inner epochs.
+  target_kl: null
+
+reward:
+  epsilon: 1.0e-8
+  r_max_um: 20.0
+  w1: 0.45
+  w2: 1.0
+  w3: 1.0
+  w4: 0.1
+  stop_lambda: 0.5
+  stop_stat: topk_mean # or using max for old logic 
+  stop_top_k: 5
+  normalize_expression_zscore: true
+  zscore_delta: 1.0e-8
+
+stopping:
+  moving_avg_window: 30
+  min_improvement: 0.001
+  patience: 30
