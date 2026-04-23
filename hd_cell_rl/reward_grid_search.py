@@ -25,10 +25,8 @@ import yaml
 from .matrix_io import resolve_matrix_csc_h5_path
 from .reward import (
     PosteriorAddBinReward,
-    build_eight_neighbor_index,
     compute_bin_log_likelihood_by_type,
     compute_reference_distribution,
-    smooth_expression_by_eight_neighbors,
 )
 
 
@@ -132,6 +130,7 @@ class RewardGridSearchConfig:
     objective: str
     epsilon: float
     r_max_um: float
+    expression_confidence_pseudocount: float
     normalize_expression_zscore: bool
     zscore_delta: float
     w4: float
@@ -176,6 +175,7 @@ class RewardGridSearchConfig:
                 "objective": self.objective,
                 "epsilon": self.epsilon,
                 "r_max_um": self.r_max_um,
+                "expression_confidence_pseudocount": self.expression_confidence_pseudocount,
                 "normalize_expression_zscore": self.normalize_expression_zscore,
                 "zscore_delta": self.zscore_delta,
                 "w4": self.w4,
@@ -202,6 +202,7 @@ class PreparedEpisodeRewardData:
     initial_membership_mask: np.ndarray
     candidate_bin_xy_um: np.ndarray
     nucleus_center_xy_um: np.ndarray
+    bin_count_totals: np.ndarray
     precomputed_ll: np.ndarray
     precomputed_d_other_um: np.ndarray
     matched_gt_cell_id: str | None = None
@@ -574,6 +575,10 @@ def load_reward_grid_search_config(config_path: str | Path) -> RewardGridSearchC
     if r_max_um <= 0:
         raise ConfigError("reward.r_max_um must be > 0")
 
+    expression_confidence_pseudocount = float(reward_cfg.get("expression_confidence_pseudocount", 5.0))
+    if expression_confidence_pseudocount < 0:
+        raise ConfigError("reward.expression_confidence_pseudocount must be >= 0")
+
     normalize_expression_zscore = bool(reward_cfg.get("normalize_expression_zscore", False))
     zscore_delta = float(reward_cfg.get("zscore_delta", 1e-8))
     if zscore_delta <= 0:
@@ -675,6 +680,7 @@ def load_reward_grid_search_config(config_path: str | Path) -> RewardGridSearchC
         objective=objective,
         epsilon=epsilon,
         r_max_um=r_max_um,
+        expression_confidence_pseudocount=expression_confidence_pseudocount,
         normalize_expression_zscore=normalize_expression_zscore,
         zscore_delta=zscore_delta,
         w4=w4,
@@ -844,6 +850,7 @@ def run_reward_grid_search(
             "reference_counts": reference_counts,
             "epsilon": float(config.epsilon),
             "r_max_um": float(config.r_max_um),
+            "expression_confidence_pseudocount": float(config.expression_confidence_pseudocount),
             "stop_stat": str(config.stop_stat),
             "stop_top_k": int(config.stop_top_k),
             "normalize_expression_zscore": bool(config.normalize_expression_zscore),
@@ -883,6 +890,7 @@ def run_reward_grid_search(
                 reference_counts=reference_counts,
                 epsilon=config.epsilon,
                 r_max_um=config.r_max_um,
+                expression_confidence_pseudocount=config.expression_confidence_pseudocount,
                 w1=w1,
                 w2=w2,
                 w3=w3,
@@ -998,6 +1006,7 @@ def _evaluate_weight_combination(
     reference_counts: np.ndarray,
     epsilon: float,
     r_max_um: float,
+    expression_confidence_pseudocount: float,
     w1: float,
     w2: float,
     w3: float,
@@ -1037,8 +1046,10 @@ def _evaluate_weight_combination(
             stop_lambda=stop_lambda,
             stop_stat=stop_stat,
             stop_top_k=stop_top_k,
+            expression_confidence_pseudocount=expression_confidence_pseudocount,
             normalize_expression_zscore=normalize_expression_zscore,
             zscore_delta=zscore_delta,
+            precomputed_bin_count_totals=episode.bin_count_totals,
             precomputed_ll=episode.precomputed_ll,
             precomputed_d_other_um=episode.precomputed_d_other_um,
         )
@@ -1127,6 +1138,7 @@ def _evaluate_weight_combination_worker(
         reference_counts=ctx["reference_counts"],
         epsilon=float(ctx["epsilon"]),
         r_max_um=float(ctx["r_max_um"]),
+        expression_confidence_pseudocount=float(ctx["expression_confidence_pseudocount"]),
         w1=float(w1),
         w2=float(w2),
         w3=float(w3),
@@ -1378,6 +1390,7 @@ def _load_prepared_episode_reward_data(
                     initial_membership_mask=initial_membership_mask,
                     candidate_bin_xy_um=episode.candidate_bin_xy_um,
                     nucleus_center_xy_um=episode.nucleus_center_xy_um,
+                    bin_count_totals=episode.bin_count_totals,
                     precomputed_ll=episode.precomputed_ll,
                     precomputed_d_other_um=episode.precomputed_d_other_um,
                     matched_gt_cell_id=matched_gt_cell_id,
@@ -1471,7 +1484,6 @@ def _load_one_episode_artifact(
     log_theta: np.ndarray,
     nuclei_spatial_index: NucleiSpatialIndex,
     include_candidate_bin_ids: bool = True,
-    smooth_neighbor_expression: bool = False,
 ) -> PreparedEpisodeRewardData | None:
     locator = _parse_episode_artifact_locator(artifact_path)
     if not locator.path.exists():
@@ -1491,23 +1503,18 @@ def _load_one_episode_artifact(
 
     if candidate_expression is not None:
         expr = np.asarray(candidate_expression, dtype=np.float64)
-        if smooth_neighbor_expression:
-            neighbor_index = build_eight_neighbor_index(candidate_bin_ids, candidate_bin_xy_um)
-            expr = smooth_expression_by_eight_neighbors(expr, neighbor_index, include_self=True)
         ll = compute_bin_log_likelihood_by_type(bin_counts=expr, theta=theta)
+        bin_count_totals = np.sum(expr, axis=1, dtype=np.float64)
     elif col_index is not None:
         if expression_loader is None:
             raise ValueError(
                 f"artifact {locator.path} stores candidate_matrix_col_index but no matrix loader is available. "
                 "Ensure episodes_index.csv is from a run with config/config_resolved.yaml and reference format is npz."
             )
-        if smooth_neighbor_expression:
-            expr = expression_loader.load_columns(col_index)
-            neighbor_index = build_eight_neighbor_index(candidate_bin_ids, candidate_bin_xy_um)
-            expr = smooth_expression_by_eight_neighbors(expr, neighbor_index, include_self=True)
-            ll = compute_bin_log_likelihood_by_type(bin_counts=expr, theta=theta)
-        else:
-            ll = expression_loader.compute_ll_for_columns(col_index=col_index, log_theta=log_theta)
+        ll, bin_count_totals = expression_loader.compute_ll_and_bin_counts_for_columns(
+            col_index=col_index,
+            log_theta=log_theta,
+        )
     else:
         raise ValueError(
             f"artifact {locator.path} must contain either candidate_expression or candidate_matrix_col_index"
@@ -1536,6 +1543,7 @@ def _load_one_episode_artifact(
         initial_membership_mask=np.zeros((ll.shape[0],), dtype=np.int8),
         candidate_bin_xy_um=candidate_bin_xy_um,
         nucleus_center_xy_um=nucleus_center_xy_um,
+        bin_count_totals=np.asarray(bin_count_totals, dtype=np.float64),
         precomputed_ll=ll,
         precomputed_d_other_um=d_other,
     )
@@ -1750,11 +1758,23 @@ class _MatrixOnDemandExpressionLoader:
 
     def compute_ll_for_columns(self, col_index: np.ndarray, log_theta: np.ndarray) -> np.ndarray:
         """Compute LL[B, K] directly from sparse matrix columns without dense BxG arrays."""
+        ll, _ = self.compute_ll_and_bin_counts_for_columns(col_index=col_index, log_theta=log_theta)
+        return ll
+
+    def compute_ll_and_bin_counts_for_columns(
+        self,
+        col_index: np.ndarray,
+        log_theta: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compute LL[B, K] and total selected-gene counts per bin from sparse columns."""
         cols = np.asarray(col_index, dtype=np.int64)
         if cols.ndim != 1:
             raise ValueError("candidate_matrix_col_index must be a 1D array")
         if cols.size == 0:
-            return np.zeros((0, int(np.asarray(log_theta).shape[0])), dtype=np.float64)
+            return (
+                np.zeros((0, int(np.asarray(log_theta).shape[0])), dtype=np.float64),
+                np.zeros((0,), dtype=np.float64),
+            )
         if (cols < 0).any():
             raise ValueError("candidate_matrix_col_index contains negative values")
         if (cols >= self._n_cols).any():
@@ -1772,6 +1792,7 @@ class _MatrixOnDemandExpressionLoader:
             )
 
         out = np.zeros((cols.size, lt.shape[0]), dtype=np.float64)
+        bin_count_totals = np.zeros((cols.size,), dtype=np.float64)
         for i, col in enumerate(cols.tolist()):
             start = int(self._indptr[col])
             end = int(self._indptr[col + 1])
@@ -1788,6 +1809,7 @@ class _MatrixOnDemandExpressionLoader:
             pos = selected_pos[keep].astype(np.int64, copy=False)
             vals = col_values[keep]
             nb = float(np.sum(vals))
+            bin_count_totals[i] = nb
             if nb <= 0:
                 continue
 
@@ -1795,7 +1817,7 @@ class _MatrixOnDemandExpressionLoader:
             weighted = np.sum(lt[:, pos] * vals[None, :], axis=1)
             out[i, :] = weighted / nb
 
-        return out
+        return out, bin_count_totals
 
     def _load_one_column(self, col_index: int) -> np.ndarray:
         cached = self._cache.get(col_index)

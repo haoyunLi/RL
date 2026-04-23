@@ -73,6 +73,7 @@ def main() -> None:
         objective=base.objective,
         epsilon=base.epsilon,
         r_max_um=base.r_max_um,
+        expression_confidence_pseudocount=base.expression_confidence_pseudocount,
         normalize_expression_zscore=base.normalize_expression_zscore,
         zscore_delta=base.zscore_delta,
         w4=base.w4 if args.w4 is None else float(args.w4),

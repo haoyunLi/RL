@@ -132,36 +132,24 @@ def compute_neighbor_support_fraction(
     return touched.astype(np.float64) / 8.0
 
 
-def smooth_expression_by_eight_neighbors(
-    expression: np.ndarray,
-    neighbor_index: np.ndarray,
-    *,
-    include_self: bool = True,
+def compute_expression_confidence(
+    bin_count_totals: np.ndarray,
+    pseudocount: float,
 ) -> np.ndarray:
-    """Average each bin expression with its available 8-neighbors."""
-    x = np.asarray(expression, dtype=np.float64)
-    neighbors = np.asarray(neighbor_index, dtype=np.int32)
-    if x.ndim != 2:
-        raise ValueError("expression must have shape (B, G)")
-    if neighbors.shape != (x.shape[0], 8):
-        raise ValueError("neighbor_index must have shape (B, 8)")
+    """Return per-bin confidence c / (c + a) from total selected-gene counts."""
+    counts = np.asarray(bin_count_totals, dtype=np.float64)
+    if counts.ndim != 1:
+        raise ValueError("bin_count_totals must be a 1D array")
+    if np.any(counts < 0):
+        raise ValueError("bin_count_totals must be non-negative")
+    if pseudocount < 0:
+        raise ValueError("pseudocount must be >= 0")
 
-    out = np.zeros_like(x, dtype=np.float64)
-    counts = np.zeros((x.shape[0],), dtype=np.float64)
-    if include_self:
-        out += x
-        counts += 1.0
-
-    for pos in range(8):
-        nbr = neighbors[:, pos]
-        valid = nbr >= 0
-        if not np.any(valid):
-            continue
-        out[valid] += x[nbr[valid]]
-        counts[valid] += 1.0
-
-    counts = np.maximum(counts, 1.0)
-    out /= counts[:, None]
+    denom = counts + float(pseudocount)
+    out = np.zeros_like(counts, dtype=np.float64)
+    positive = denom > 0
+    if np.any(positive):
+        out[positive] = counts[positive] / denom[positive]
     return out
 
 
@@ -318,9 +306,10 @@ class PosteriorAddBinReward:
     Implements the exact formula family:
     - theta[k,g] from reference counts with pseudocount epsilon
     - LL[b,k] per bin/type normalized by bin total counts
+    - conf[b] = c[b] / (c[b] + a), where c[b] is selected-gene total count in bin b
     - p(k|ST) from softmax(log p(ST|k) + uniform prior)
     - neighbor_support[b] = touched_8_neighbors[b] / 8
-    - R_add[b] = w1 * R_expr[b] - w2 * P_dis[b] - w3 * P_overlap[b] + w4 * neighbor_support[b]
+    - R_add[b] = w1 * (conf[b] * R_expr[b]) - w2 * P_dis[b] - w3 * P_overlap[b] + w4 * neighbor_support[b]
     - R_stop = -lambda * stop_delta over currently add-eligible bins
       where stop_delta is either max frontier add reward or mean(top-k frontier add rewards)
     """
@@ -343,10 +332,12 @@ class PosteriorAddBinReward:
         stop_lambda: float = 1.0,
         stop_stat: str = "max",
         stop_top_k: int = 3,
+        expression_confidence_pseudocount: float = 5.0,
         normalize_expression_zscore: bool = False,
         zscore_delta: float = 1e-8,
         remove_reward: float = 0.0,
         precomputed_ll: np.ndarray | None = None,
+        precomputed_bin_count_totals: np.ndarray | None = None,
         precomputed_d_other_um: np.ndarray | None = None,
     ) -> None:
         """Create reward object with all static per-episode inputs.
@@ -371,6 +362,8 @@ class PosteriorAddBinReward:
 
         if zscore_delta <= 0:
             raise ValueError("zscore_delta must be > 0")
+        if expression_confidence_pseudocount < 0:
+            raise ValueError("expression_confidence_pseudocount must be >= 0")
 
         self._candidate_bin_ids = tuple(str(x) for x in candidate_bin_ids)
         self._bin_id_to_index = {bin_id: i for i, bin_id in enumerate(self._candidate_bin_ids)}
@@ -387,6 +380,7 @@ class PosteriorAddBinReward:
         if self._nucleus_center.shape != (2,):
             raise ValueError("nucleus_center_xy_um must have shape (2,)")
 
+        bin_count_totals: np.ndarray
         if precomputed_ll is not None:
             ll = np.asarray(precomputed_ll, dtype=np.float64)
             if ll.ndim != 2:
@@ -409,6 +403,9 @@ class PosteriorAddBinReward:
                     "reference_counts K dimension must match precomputed_ll: %d != %d"
                     % (ref_counts.shape[0] if ref_counts.ndim == 2 else -1, self._n_cell_types)
                 )
+            if precomputed_bin_count_totals is None:
+                raise ValueError("precomputed_bin_count_totals must be provided when precomputed_ll is set")
+            bin_count_totals = np.asarray(precomputed_bin_count_totals, dtype=np.float64)
         else:
             if candidate_expression is None:
                 raise ValueError("candidate_expression must be provided when precomputed_ll is not set")
@@ -428,6 +425,14 @@ class PosteriorAddBinReward:
                 )
             self._ll = compute_bin_log_likelihood_by_type(bin_counts=x, theta=theta)  # (B, K)
             self._n_cell_types = int(theta.shape[0])
+            bin_count_totals = np.sum(x, axis=1, dtype=np.float64)
+
+        if bin_count_totals.shape != (n_bins,):
+            raise ValueError(
+                "bin count totals must have shape (B,), got %r for B=%d" % (bin_count_totals.shape, n_bins)
+            )
+        if np.any(bin_count_totals < 0):
+            raise ValueError("bin count totals must be non-negative")
 
         self._log_prior = -np.log(float(self._n_cell_types))
 
@@ -479,6 +484,10 @@ class PosteriorAddBinReward:
         self._normalize_expression_zscore = bool(normalize_expression_zscore)
         self._zscore_delta = float(zscore_delta)
         self._remove_reward = float(remove_reward)
+        self._expression_confidence = compute_expression_confidence(
+            bin_count_totals=bin_count_totals,
+            pseudocount=float(expression_confidence_pseudocount),
+        )
         self._p_dis = self._d_n / self._r_max_um
         self._p_overlap = np.maximum(0.0, (self._d_n - self._d_other) / self._r_max_um)
         self._neighbor_index = build_eight_neighbor_index(self._candidate_bin_ids, self._bin_xy)
@@ -509,7 +518,7 @@ class PosteriorAddBinReward:
     def expression_reward_per_bin(self, membership_mask: np.ndarray) -> np.ndarray:
         """Compute R_expr[b] = sum_k p(k|ST) * LL[b,k] for all bins."""
         posterior = self.posterior_given_state(membership_mask)
-        return np.sum(self._ll * posterior[None, :], axis=1)
+        return np.sum(self._ll * posterior[None, :], axis=1) * self._expression_confidence
 
     def add_reward_for_bin(self, membership_mask: np.ndarray, bin_id: str) -> float:
         """Compute R_add for one bin only.
@@ -531,7 +540,7 @@ class PosteriorAddBinReward:
         eligible = self.frontier_add_mask(mask)
 
         posterior = self.posterior_given_state(mask)
-        r_expr = np.sum(self._ll * posterior[None, :], axis=1)
+        r_expr = np.sum(self._ll * posterior[None, :], axis=1) * self._expression_confidence
 
         if self._normalize_expression_zscore:
             if np.any(eligible):
@@ -656,10 +665,10 @@ class PosteriorAddBinReward:
         - If z-score normalization is enabled, computes required eligible-bin
           statistics first.
         """
-        expr = float(np.sum(self._ll[bin_index] * posterior))
+        expr = float(np.sum(self._ll[bin_index] * posterior) * self._expression_confidence[bin_index])
 
         if self._normalize_expression_zscore:
-            r_expr = np.sum(self._ll * posterior[None, :], axis=1)
+            r_expr = np.sum(self._ll * posterior[None, :], axis=1) * self._expression_confidence
             eligible = self.frontier_add_mask(membership_mask)
             if np.any(eligible):
                 mu = float(np.mean(r_expr[eligible]))

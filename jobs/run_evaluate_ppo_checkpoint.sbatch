@@ -5,8 +5,8 @@
 #SBATCH --time=72:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=120G
+#SBATCH --cpus-per-task=96
+#SBATCH --mem=800G
 #SBATCH --output=evaluate_ppo_checkpoint.out
 #SBATCH --error=evaluate_ppo_checkpoint.err
 
@@ -25,21 +25,21 @@ conda activate "$WORK_DIR/Bin2Cell_Validation"
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
-export TORCH_NUM_THREADS=16
+export TORCH_NUM_THREADS=32
 export TORCH_NUM_INTEROP_THREADS=1
 unset KMP_LOGFILE || true
 unset LOGFILE || true
 
-CHECKPOINT_PATH="${CHECKPOINT_PATH:-runs/human_colorectal_ppo_20260408T164518Z/checkpoints/best_model.pt}"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-runs/human_colorectal_ppo_20260421T184811Z/checkpoints/best_model.pt}"
 PPO_CONFIG="${PPO_CONFIG:-}"
 EPISODES_INDEX_PATH="${EPISODES_INDEX_PATH:-}"
-MAX_EPISODES="${MAX_EPISODES:-200}"
+MAX_EPISODES="${MAX_EPISODES:-300}"
 POLICY_MODE="${POLICY_MODE:-greedy}"
 RUN_DEVICE="${RUN_DEVICE:-auto}"
 EVAL_SEED="${EVAL_SEED:-7}"
 RUN_NAME="${RUN_NAME:-human_colorectal_ppo_eval}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-runs}"
-OVERLAY_MAX_CELLS="${OVERLAY_MAX_CELLS:-200}"
+OVERLAY_MAX_CELLS="${OVERLAY_MAX_CELLS:-300}"
 OVERLAY_SELECTION="${OVERLAY_SELECTION:-top_reward}"
 GT_CELL_BINS_PATH="${GT_CELL_BINS_PATH:-workspace_outputs/pseudo_human_colorectal/intermediate/cropped_visium_hd_human_colorectal_pseudo_square_002um_cell_bins.csv.gz}"
 GT_NUCLEAR_BINS_PATH="${GT_NUCLEAR_BINS_PATH:-workspace_outputs/pseudo_human_colorectal/intermediate/cropped_visium_hd_human_colorectal_pseudo_square_002um_nuclear_bins.csv.gz}"

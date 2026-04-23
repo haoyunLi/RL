@@ -7,6 +7,7 @@ import argparse
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 import datetime as dt
+import gzip
 import json
 from pathlib import Path
 import random
@@ -58,6 +59,7 @@ class EpisodeEvalRecord:
     final_membership_mask: np.ndarray
     candidate_bin_xy_um: np.ndarray
     nucleus_center_xy_um: np.ndarray
+    action_trace: tuple[dict[str, Any], ...] = ()
     gt_cell_xy_um: np.ndarray | None = None
     gt_nuclear_xy_um: np.ndarray | None = None
 
@@ -187,8 +189,10 @@ def _run_single_episode(
     final_info: dict[str, Any] | None = None
     terminated = False
     truncated = False
+    action_trace: list[dict[str, Any]] = []
 
     while True:
+        step_index = int(obs["step_index"])
         g_t, a_t, m_t = _observation_to_tensors(obs, device=device)
         with torch.inference_mode():
             dist, _ = model(g_t, a_t, m_t)
@@ -207,6 +211,19 @@ def _run_single_episode(
         final_info = info
         terminated = bool(term)
         truncated = bool(trunc)
+        chosen_barcode = None if action == 0 else str(context.candidate_bin_ids[action - 1])
+        action_trace.append(
+            {
+                "step_index": int(step_index),
+                "action": int(action),
+                "action_probability": float(probs[action]),
+                "reward": float(reward),
+                "chosen_barcode": chosen_barcode,
+                "terminated_after_action": bool(term),
+                "truncated_after_action": bool(trunc),
+                "n_assigned_bins_after": int(info.get("n_assigned_bins", 0)),
+            }
+        )
         if term or trunc:
             break
 
@@ -229,6 +246,7 @@ def _run_single_episode(
         final_membership_mask=final_membership_mask,
         candidate_bin_xy_um=np.asarray(context.candidate_bin_xy_um, dtype=np.float32),
         nucleus_center_xy_um=np.asarray(context.nucleus_center_xy_um, dtype=np.float32),
+        action_trace=tuple(action_trace),
     )
 
 
@@ -803,6 +821,40 @@ def _save_overlay_plots(
     return saved
 
 
+def _write_step_traces(
+    *,
+    records: list[EpisodeEvalRecord],
+    run_dir: Path,
+) -> list[EpisodeEvalRecord]:
+    """Write one compressed per-episode action trace for exact replay."""
+    if not records:
+        return records
+
+    traces_dir = run_dir / "step_traces"
+    traces_dir.mkdir(parents=True, exist_ok=True)
+
+    updated: list[EpisodeEvalRecord] = []
+    for idx, rec in enumerate(records):
+        trace_relpath = Path("step_traces") / f"trace_{idx:04d}_{_slug(str(rec.metrics['cell_id']))}.json.gz"
+        trace_abspath = run_dir / trace_relpath
+        payload = {
+            "cell_id": str(rec.metrics["cell_id"]),
+            "candidate_bin_count": int(len(rec.candidate_bin_ids)),
+            "n_steps": int(len(rec.action_trace)),
+            "action_trace": list(rec.action_trace),
+        }
+        with gzip.open(trace_abspath, "wt", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=False)
+            handle.write("\n")
+        updated.append(
+            replace(
+                rec,
+                metrics={**rec.metrics, "step_trace_path": str(trace_relpath)},
+            )
+        )
+    return updated
+
+
 def main() -> None:
     args = _build_arg_parser().parse_args()
     if args.max_episodes <= 0:
@@ -903,6 +955,8 @@ def main() -> None:
             min_overlap_bins=int(args.gt_min_nuclear_overlap_bins),
         )
 
+    episode_records = _write_step_traces(records=episode_records, run_dir=run_dir)
+
     results = [rec.metrics for rec in episode_records]
     df = pd.DataFrame(results)
     df.to_csv(run_dir / "per_episode.csv", index=False)
@@ -941,6 +995,9 @@ def main() -> None:
         "matplotlib_available": bool(HAS_MATPLOTLIB),
         "n_summary_plots": int(len(summary_plots)),
         "n_overlay_plots": int(len(overlay_plots)),
+        "step_traces_enabled": True,
+        "step_traces_dir": str(run_dir / "step_traces"),
+        "n_step_trace_files": int(len(episode_records)),
     }
     if "matched_gt_cell_id" in df.columns:
         matched = df["matched_gt_cell_id"].astype("string").notna()

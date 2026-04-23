@@ -31,9 +31,6 @@ inputs:
   # Optional override for matrix-column expression loader cache.
   # If null, value from episodes run config is reused.
   expression_cache_size: null
-  # Smooth each candidate bin by averaging with its available 8-neighbors at episode-load time.
-  # This does not require rebuilding episode artifacts.
-  expression_neighbor_smoothing: true
 
 ppo:
   gamma: 0.99
@@ -41,15 +38,15 @@ ppo:
   normalize_advantages: true
   eps_clip: 0.2
   ppo_epochs: 4
-  minibatch_size: 1024
-  learning_rate: 3.0e-4
+  minibatch_size: 512
+  learning_rate: 1.0e-4
   weight_decay: 0.0
   vf_coef: 0.5
-  ent_coef: 0.01
+  ent_coef: 0.008
   max_grad_norm: 1.0
-  hidden_dim: 128
+  hidden_dim: 256
   # Optional KL guardrail for PPO inner epochs.
-  target_kl: null
+  target_kl: 0.01
 
 reward:
   epsilon: 1.0e-8
@@ -57,10 +54,11 @@ reward:
   w1: 0.45
   w2: 1.0
   w3: 1.0
-  w4: 0.1
-  stop_lambda: 0.5
+  w4: 0.05
+  stop_lambda: 0.7
   stop_stat: topk_mean # or using max for old logic 
   stop_top_k: 5
+  expression_confidence_pseudocount: 5.0
   normalize_expression_zscore: true
   zscore_delta: 1.0e-8
 

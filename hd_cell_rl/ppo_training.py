@@ -30,6 +30,7 @@ import yaml
 
 from .reward import (
     build_eight_neighbor_index,
+    compute_expression_confidence,
     compute_stop_delta,
     compute_frontier_eligible_mask,
     compute_neighbor_support_fraction,
@@ -74,7 +75,6 @@ class PPOTrainingConfig:
     nuclei_format: str
     nuclei_columns: dict[str, str]
     expression_cache_size: int | None
-    expression_neighbor_smoothing: bool
 
     gamma: float
     normalize_returns_per_episode: bool
@@ -99,6 +99,7 @@ class PPOTrainingConfig:
     stop_lambda: float
     stop_stat: str
     stop_top_k: int
+    expression_confidence_pseudocount: float
     normalize_expression_zscore: bool
     zscore_delta: float
 
@@ -134,7 +135,6 @@ class PPOTrainingConfig:
                     "columns": self.nuclei_columns,
                 },
                 "expression_cache_size": self.expression_cache_size,
-                "expression_neighbor_smoothing": self.expression_neighbor_smoothing,
             },
             "ppo": {
                 "gamma": self.gamma,
@@ -161,6 +161,7 @@ class PPOTrainingConfig:
                 "stop_lambda": self.stop_lambda,
                 "stop_stat": self.stop_stat,
                 "stop_top_k": self.stop_top_k,
+                "expression_confidence_pseudocount": self.expression_confidence_pseudocount,
                 "normalize_expression_zscore": self.normalize_expression_zscore,
                 "zscore_delta": self.zscore_delta,
             },
@@ -187,6 +188,7 @@ class EpisodeContext:
     ll_mean_z: np.ndarray  # (B,), float32
     ll_max_z: np.ndarray  # (B,), float32
     base_penalty: np.ndarray  # (B,), float32 = w2*p_dis + w3*p_overlap
+    expression_confidence: np.ndarray  # (B,), float32
     neighbor_index: np.ndarray  # (B, 8), int32
     max_steps: int
     log_prior: float
@@ -198,6 +200,7 @@ class EpisodeContext:
     stop_lambda: float
     stop_stat: str
     stop_top_k: int
+    expression_confidence_pseudocount: float
     normalize_expression_zscore: bool
     zscore_delta: float
 
@@ -252,9 +255,11 @@ class RolloutTransition:
 class EpisodeStaticPolicyFeatures:
     """Per-episode static policy feature template reused across many transitions."""
 
+    context: EpisodeContext
     action_template: np.ndarray  # (A, F), float32
     n_bins: int
     n_bins_scaled: float
+    seed_size_scaled: float
     max_steps: int
 
 
@@ -268,6 +273,10 @@ class RolloutFeatureCache:
     assigned_frac: np.ndarray  # (N,), float32
     step_frac: np.ndarray  # (N,), float32
     remaining_frac: np.ndarray  # (N,), float32
+    grow_ratio_scaled: np.ndarray  # (N,), float32
+    positive_frontier_fraction: np.ndarray  # (N,), float32
+    centroid_drift_scaled: np.ndarray  # (N,), float32
+    compactness_proxy: np.ndarray  # (N,), float32
     assigned_ll_mean: np.ndarray  # (N,), float32
     assigned_ll_max: np.ndarray  # (N,), float32
     actions: np.ndarray  # (N,), int64
@@ -380,6 +389,11 @@ class ActorCritic(nn.Module):
         stop_features[:, 3] = global_features[:, 2]
         stop_features[:, 4] = global_features[:, 3]
         stop_features[:, 5] = global_features[:, 5]
+        stop_features[:, 6] = global_features[:, 6]
+        stop_features[:, 7] = global_features[:, 7]
+        stop_features[:, 8] = global_features[:, 8]
+        stop_features[:, 9] = global_features[:, 9]
+        stop_features[:, 10] = global_features[:, 10]
         stop_latent = self.encode_action_features(stop_features)
         return self.policy_logits_from_action_latent(stop_latent)
 
@@ -510,7 +524,6 @@ class EpisodeDataset:
             log_theta=self._log_theta,
             nuclei_spatial_index=self._nuclei_spatial_index,
             include_candidate_bin_ids=True,
-            smooth_neighbor_expression=bool(self._config.expression_neighbor_smoothing),
         )
         if prepared is None:
             return None
@@ -534,6 +547,10 @@ class EpisodeDataset:
         w2 = float(self._config.w2)
         w3 = float(self._config.w3)
         base_penalty = (w2 * p_dis + w3 * p_overlap).astype(np.float32, copy=False)
+        expression_confidence = compute_expression_confidence(
+            bin_count_totals=np.asarray(prepared.bin_count_totals, dtype=np.float64),
+            pseudocount=float(self._config.expression_confidence_pseudocount),
+        ).astype(np.float32, copy=False)
         neighbor_index = build_eight_neighbor_index(prepared.candidate_bin_ids, bin_xy).astype(np.int32, copy=False)
         initial_membership_mask = _build_initial_membership_mask(
             candidate_bin_ids=prepared.candidate_bin_ids,
@@ -554,6 +571,7 @@ class EpisodeDataset:
             ll_mean_z=ll_mean_z,
             ll_max_z=ll_max_z,
             base_penalty=base_penalty,
+            expression_confidence=expression_confidence,
             neighbor_index=neighbor_index,
             max_steps=max_steps,
             log_prior=-np.log(float(ll.shape[1])),
@@ -565,6 +583,7 @@ class EpisodeDataset:
             stop_lambda=float(self._config.stop_lambda),
             stop_stat=str(self._config.stop_stat),
             stop_top_k=int(self._config.stop_top_k),
+            expression_confidence_pseudocount=float(self._config.expression_confidence_pseudocount),
             normalize_expression_zscore=bool(self._config.normalize_expression_zscore),
             zscore_delta=float(self._config.zscore_delta),
         )
@@ -652,8 +671,8 @@ class AddStopCellEnv:
     - reward formulas are implemented in `_add_reward_for_bin` and `_stop_reward`.
     """
 
-    ACTION_FEATURE_DIM = 6
-    GLOBAL_FEATURE_DIM = 6
+    ACTION_FEATURE_DIM = 13
+    GLOBAL_FEATURE_DIM = 11
 
     def __init__(self, context: EpisodeContext) -> None:
         self._ctx = context
@@ -673,7 +692,12 @@ class AddStopCellEnv:
         self._assigned_ll_max_sum = 0.0
         self._n_bins = int(self._ctx.n_bins)
         self._n_bins_scaled = float(np.log1p(self._n_bins) / 8.0)
-        self._action_template = _build_static_action_template(self._ctx, self._n_bins_scaled)
+        self._seed_size_scaled = _scale_seed_size_feature(int(np.sum(self._initial_membership_mask)))
+        self._action_template = _build_static_action_template(
+            self._ctx,
+            self._n_bins_scaled,
+            self._seed_size_scaled,
+        )
         self._action_features = self._action_template.copy()
         self._action_mask = np.ones(self._n_bins + 1, dtype=bool)
         self._action_mask[0] = True
@@ -744,8 +768,8 @@ class AddStopCellEnv:
         neighbor_support = float(
             compute_neighbor_support_fraction(self._membership_mask, self._ctx.neighbor_index)[bin_idx]
         )
+        r_expr = (self._ctx.ll @ posterior) * self._ctx.expression_confidence
         if self._ctx.normalize_expression_zscore:
-            r_expr = self._ctx.ll @ posterior
             eligible = self._action_mask[1:]
             if np.any(eligible):
                 expr_eligible = r_expr[eligible]
@@ -755,11 +779,10 @@ class AddStopCellEnv:
             else:
                 expr_term = 0.0
             return float(self._ctx.w1 * expr_term - self._ctx.base_penalty[bin_idx] + self._ctx.w4 * neighbor_support)
-        r_expr = float(np.dot(self._ctx.ll[bin_idx], posterior))
-        return float(self._ctx.w1 * r_expr - self._ctx.base_penalty[bin_idx] + self._ctx.w4 * neighbor_support)
+        return float(self._ctx.w1 * float(r_expr[bin_idx]) - self._ctx.base_penalty[bin_idx] + self._ctx.w4 * neighbor_support)
 
     def _all_add_rewards(self, posterior: np.ndarray) -> np.ndarray:
-        r_expr = self._ctx.ll @ posterior
+        r_expr = (self._ctx.ll @ posterior) * self._ctx.expression_confidence
         if self._ctx.normalize_expression_zscore:
             eligible = self._action_mask[1:]
             if np.any(eligible):
@@ -793,33 +816,35 @@ class AddStopCellEnv:
 
         Replace this feature construction if you want richer HD-specific inputs.
         """
-        n_bins = self._n_bins
-
-        assigned_frac = (float(self._assigned_count) / float(n_bins)) if n_bins > 0 else 0.0
-        step_frac = float(self._step_index / max(1, self._ctx.max_steps))
-        remaining_frac = (float(n_bins - self._assigned_count) / float(n_bins)) if n_bins > 0 else 0.0
-
-        if self._assigned_count > 0:
-            assigned_ll_mean = float(self._assigned_ll_mean_sum / float(self._assigned_count))
-            assigned_ll_max = float(self._assigned_ll_max_sum / float(self._assigned_count))
-        else:
-            assigned_ll_mean = 0.0
-            assigned_ll_max = 0.0
+        summary = _compute_state_summary_from_mask(
+            ctx=self._ctx,
+            membership_mask=self._membership_mask,
+            step_index=self._step_index,
+        )
 
         global_features = self._global_features
-        global_features[0] = np.float32(assigned_frac)
-        global_features[1] = np.float32(step_frac)
+        global_features[0] = np.float32(summary["assigned_frac"])
+        global_features[1] = np.float32(summary["step_frac"])
         global_features[2] = np.float32(self._n_bins_scaled)
-        global_features[3] = np.float32(assigned_ll_mean)
-        global_features[4] = np.float32(assigned_ll_max)
-        global_features[5] = np.float32(remaining_frac)
+        global_features[3] = np.float32(summary["assigned_ll_mean"])
+        global_features[4] = np.float32(summary["assigned_ll_max"])
+        global_features[5] = np.float32(summary["remaining_frac"])
+        global_features[6] = np.float32(self._seed_size_scaled)
+        global_features[7] = np.float32(summary["grow_ratio_scaled"])
+        global_features[8] = np.float32(summary["positive_frontier_fraction"])
+        global_features[9] = np.float32(summary["centroid_drift_scaled"])
+        global_features[10] = np.float32(summary["compactness_proxy"])
 
         action_features = self._action_features
         # STOP action dynamic fields.
-        action_features[0, 1] = np.float32(assigned_frac)
-        action_features[0, 2] = np.float32(step_frac)
-        action_features[0, 4] = np.float32(assigned_ll_mean)
-        action_features[0, 5] = np.float32(remaining_frac)
+        action_features[0, 1] = np.float32(summary["assigned_frac"])
+        action_features[0, 2] = np.float32(summary["step_frac"])
+        action_features[0, 4] = np.float32(summary["assigned_ll_mean"])
+        action_features[0, 5] = np.float32(summary["remaining_frac"])
+        action_features[0, 7] = np.float32(summary["grow_ratio_scaled"])
+        action_features[0, 8] = np.float32(summary["positive_frontier_fraction"])
+        action_features[0, 9] = np.float32(summary["centroid_drift_scaled"])
+        action_features[0, 10] = np.float32(summary["compactness_proxy"])
 
         return {
             "global_features": global_features,
@@ -830,13 +855,21 @@ class AddStopCellEnv:
         }
 
     def _refresh_dynamic_action_state(self) -> None:
-        """Refresh frontier-only action mask and membership feature column."""
+        """Refresh frontier mask plus dynamic ADD-row feature columns."""
         self._action_mask.fill(False)
         self._action_mask[0] = True
         if self._n_bins > 0:
             frontier = compute_frontier_eligible_mask(self._membership_mask, self._ctx.neighbor_index)
             self._action_mask[1:] = frontier
             self._action_features[1:, 5] = self._membership_mask.astype(np.float32, copy=False)
+            self._action_features[1:, 11:13] = np.float32(0.0)
+            candidate_centroid_distance, candidate_compactness_gain = _compute_dynamic_add_action_features(
+                ctx=self._ctx,
+                membership_mask=self._membership_mask,
+                frontier_mask=frontier,
+            )
+            self._action_features[1:, 11] = candidate_centroid_distance
+            self._action_features[1:, 12] = candidate_compactness_gain
 
     def _build_info(self) -> dict[str, Any]:
         return {
@@ -1184,21 +1217,12 @@ def _collect_trajectories_vectorized(
     rng: np.random.Generator,
 ) -> list[EpisodeTrajectory]:
     """Synchronous vectorized rollout: batch active envs each step."""
-    del rng  # Torch sampling is used for batched action draws.
     n_envs = len(contexts)
     envs = [AddStopCellEnv(ctx) for ctx in contexts]
-    static_policy = tuple(_build_episode_static_policy_features(ctx) for ctx in contexts)
     observations: list[dict[str, Any]] = []
     for env in envs:
         obs, _ = env.reset()
         observations.append(obs)
-
-    with torch.inference_mode():
-        static_add_logits = _precompute_rollout_add_logits(
-            episode_static=static_policy,
-            model=model,
-            device=device,
-        )
 
     episode_steps: list[list[EpisodeStep]] = [[] for _ in range(n_envs)]
     total_rewards = np.zeros((n_envs,), dtype=np.float64)
@@ -1206,18 +1230,10 @@ def _collect_trajectories_vectorized(
 
     while active_slots:
         active_obs = [observations[slot] for slot in active_slots]
-        global_t = _batch_global_features_for_rollout(active_obs, device=device)
+        global_t, action_t, mask_t = _batch_observations_for_rollout(active_obs, device=device)
 
         with torch.inference_mode():
-            values = model.value_from_global_latent(model.encode_global(global_t))
-            stop_logits = model.stop_logits_from_global_features(global_t)
-            dist = _build_vectorized_rollout_distribution(
-                active_slots=active_slots,
-                observations=active_obs,
-                stop_logits=stop_logits,
-                static_add_logits=static_add_logits,
-                device=device,
-            )
+            dist, values = model(global_t, action_t, mask_t)
             probs = dist.probs
             if probs.ndim != 2:
                 raise RuntimeError("expected batched action probabilities with shape (N, A)")
@@ -1266,74 +1282,6 @@ def _collect_trajectories_vectorized(
         )
         for slot in range(n_envs)
     ]
-
-
-def _precompute_rollout_add_logits(
-    *,
-    episode_static: tuple[EpisodeStaticPolicyFeatures, ...],
-    model: ActorCritic,
-    device: torch.device,
-) -> tuple[torch.Tensor, ...]:
-    """Encode static ADD-bin features once per rollout/update.
-
-    Model weights stay fixed during rollout collection, so ADD logits can be reused
-    across all states of the same cell. Only STOP logits depend on dynamic state
-    features and must be recomputed each step.
-    """
-    out: list[torch.Tensor] = []
-    for static in episode_static:
-        if static.n_bins == 0:
-            out.append(torch.empty((0,), device=device, dtype=torch.float32))
-            continue
-        add_features_t = torch.as_tensor(static.action_template[1:, :], device=device, dtype=torch.float32)
-        add_latent = model.encode_action_features(add_features_t)
-        add_logits = model.policy_logits_from_action_latent(add_latent)
-        out.append(add_logits.detach())
-    return tuple(out)
-
-
-def _build_vectorized_rollout_distribution(
-    *,
-    active_slots: list[int],
-    observations: list[dict[str, Any]],
-    stop_logits: torch.Tensor,
-    static_add_logits: tuple[torch.Tensor, ...],
-    device: torch.device,
-) -> Categorical:
-    """Assemble masked categorical distribution for active vectorized envs."""
-    n_active = len(active_slots)
-    if int(stop_logits.shape[0]) != n_active:
-        raise ValueError("stop_logits batch size mismatch for vectorized rollout")
-
-    max_actions = 1
-    for slot in active_slots:
-        max_actions = max(max_actions, 1 + int(static_add_logits[slot].numel()))
-
-    logits_batch = torch.full(
-        (n_active, max_actions),
-        fill_value=torch.finfo(stop_logits.dtype).min,
-        device=device,
-        dtype=stop_logits.dtype,
-    )
-    mask_batch = torch.zeros((n_active, max_actions), device=device, dtype=torch.bool)
-    logits_batch[:, 0] = stop_logits
-    mask_batch[:, 0] = True
-
-    for local_idx, slot in enumerate(active_slots):
-        add_logits = static_add_logits[slot]
-        n_bins = int(add_logits.numel())
-        if n_bins == 0:
-            continue
-        valid_add_mask = torch.as_tensor(
-            np.asarray(observations[local_idx]["membership_mask"], dtype=np.uint8) == 0,
-            device=device,
-            dtype=torch.bool,
-        )
-        logits_batch[local_idx, 1 : n_bins + 1] = add_logits
-        mask_batch[local_idx, 1 : n_bins + 1] = valid_add_mask
-
-    masked_logits = logits_batch.masked_fill(~mask_batch, torch.finfo(logits_batch.dtype).min)
-    return Categorical(logits=masked_logits)
 
 
 def _rollout_worker(
@@ -1666,7 +1614,6 @@ def load_ppo_training_config(config_path: str | Path) -> PPOTrainingConfig:
     expression_cache_size = None if expression_cache_size_raw is None else int(expression_cache_size_raw)
     if expression_cache_size is not None and expression_cache_size < 0:
         raise ConfigError("inputs.expression_cache_size must be >= 0 when provided")
-    expression_neighbor_smoothing = bool(inputs.get("expression_neighbor_smoothing", False))
 
     gamma = float(ppo.get("gamma", 0.99))
     if not (0.0 < gamma <= 1.0):
@@ -1722,6 +1669,9 @@ def load_ppo_training_config(config_path: str | Path) -> PPOTrainingConfig:
     stop_top_k = int(reward.get("stop_top_k", 3))
     if stop_top_k <= 0:
         raise ConfigError("reward.stop_top_k must be > 0")
+    expression_confidence_pseudocount = float(reward.get("expression_confidence_pseudocount", 5.0))
+    if expression_confidence_pseudocount < 0:
+        raise ConfigError("reward.expression_confidence_pseudocount must be >= 0")
     for name, val in (("w1", w1), ("w2", w2), ("w3", w3), ("stop_lambda", stop_lambda)):
         if val <= 0:
             raise ConfigError(f"reward.{name} must be > 0")
@@ -1761,7 +1711,6 @@ def load_ppo_training_config(config_path: str | Path) -> PPOTrainingConfig:
         nuclei_format=nuclei_format,
         nuclei_columns=nuclei_columns,
         expression_cache_size=expression_cache_size,
-        expression_neighbor_smoothing=expression_neighbor_smoothing,
         gamma=gamma,
         normalize_returns_per_episode=normalize_returns_per_episode,
         normalize_advantages=normalize_advantages,
@@ -1784,6 +1733,7 @@ def load_ppo_training_config(config_path: str | Path) -> PPOTrainingConfig:
         stop_lambda=stop_lambda,
         stop_stat=stop_stat,
         stop_top_k=stop_top_k,
+        expression_confidence_pseudocount=expression_confidence_pseudocount,
         normalize_expression_zscore=normalize_expression_zscore,
         zscore_delta=zscore_delta,
         moving_avg_window=moving_avg_window,
@@ -1860,6 +1810,10 @@ def _build_rollout_feature_cache(
             assigned_frac=np.zeros((0,), dtype=np.float32),
             step_frac=np.zeros((0,), dtype=np.float32),
             remaining_frac=np.zeros((0,), dtype=np.float32),
+            grow_ratio_scaled=np.zeros((0,), dtype=np.float32),
+            positive_frontier_fraction=np.zeros((0,), dtype=np.float32),
+            centroid_drift_scaled=np.zeros((0,), dtype=np.float32),
+            compactness_proxy=np.zeros((0,), dtype=np.float32),
             assigned_ll_mean=np.zeros((0,), dtype=np.float32),
             assigned_ll_max=np.zeros((0,), dtype=np.float32),
             actions=np.zeros((0,), dtype=np.int64),
@@ -1873,6 +1827,10 @@ def _build_rollout_feature_cache(
     assigned_frac = np.zeros((n,), dtype=np.float32)
     step_frac = np.zeros((n,), dtype=np.float32)
     remaining_frac = np.zeros((n,), dtype=np.float32)
+    grow_ratio_scaled = np.zeros((n,), dtype=np.float32)
+    positive_frontier_fraction = np.zeros((n,), dtype=np.float32)
+    centroid_drift_scaled = np.zeros((n,), dtype=np.float32)
+    compactness_proxy = np.zeros((n,), dtype=np.float32)
     assigned_ll_mean = np.zeros((n,), dtype=np.float32)
     assigned_ll_max = np.zeros((n,), dtype=np.float32)
     actions = np.zeros((n,), dtype=np.int64)
@@ -1892,6 +1850,10 @@ def _build_rollout_feature_cache(
         assigned_frac[i] = np.float32(summary["assigned_frac"])
         step_frac[i] = np.float32(summary["step_frac"])
         remaining_frac[i] = np.float32(summary["remaining_frac"])
+        grow_ratio_scaled[i] = np.float32(summary["grow_ratio_scaled"])
+        positive_frontier_fraction[i] = np.float32(summary["positive_frontier_fraction"])
+        centroid_drift_scaled[i] = np.float32(summary["centroid_drift_scaled"])
+        compactness_proxy[i] = np.float32(summary["compactness_proxy"])
         assigned_ll_mean[i] = np.float32(summary["assigned_ll_mean"])
         assigned_ll_max[i] = np.float32(summary["assigned_ll_max"])
         actions[i] = int(t.action)
@@ -1906,6 +1868,10 @@ def _build_rollout_feature_cache(
         assigned_frac=assigned_frac,
         step_frac=step_frac,
         remaining_frac=remaining_frac,
+        grow_ratio_scaled=grow_ratio_scaled,
+        positive_frontier_fraction=positive_frontier_fraction,
+        centroid_drift_scaled=centroid_drift_scaled,
+        compactness_proxy=compactness_proxy,
         assigned_ll_mean=assigned_ll_mean,
         assigned_ll_max=assigned_ll_max,
         actions=actions,
@@ -1950,11 +1916,23 @@ def _collate_minibatch_from_cache(
                 n_bits=static.n_bins,
             )
             af_padded[i, 1:ai, 5] = membership.astype(np.float32, copy=False)
-            am_padded[i, 1:ai] = membership == 0
+            frontier = compute_frontier_eligible_mask(membership, static.context.neighbor_index)
+            am_padded[i, 1:ai] = frontier
+            candidate_centroid_distance, candidate_compactness_gain = _compute_dynamic_add_action_features(
+                ctx=static.context,
+                membership_mask=membership,
+                frontier_mask=frontier,
+            )
+            af_padded[i, 1:ai, 11] = candidate_centroid_distance
+            af_padded[i, 1:ai, 12] = candidate_compactness_gain
 
         assigned_frac_i = float(rollout_cache.assigned_frac[idx])
         step_frac_i = float(rollout_cache.step_frac[idx])
         remaining_frac_i = float(rollout_cache.remaining_frac[idx])
+        grow_ratio_scaled_i = float(rollout_cache.grow_ratio_scaled[idx])
+        positive_frontier_fraction_i = float(rollout_cache.positive_frontier_fraction[idx])
+        centroid_drift_scaled_i = float(rollout_cache.centroid_drift_scaled[idx])
+        compactness_proxy_i = float(rollout_cache.compactness_proxy[idx])
         assigned_ll_mean_i = float(rollout_cache.assigned_ll_mean[idx])
         assigned_ll_max_i = float(rollout_cache.assigned_ll_max[idx])
 
@@ -1962,6 +1940,10 @@ def _collate_minibatch_from_cache(
         af_padded[i, 0, 2] = np.float32(step_frac_i)
         af_padded[i, 0, 4] = np.float32(assigned_ll_mean_i)
         af_padded[i, 0, 5] = np.float32(remaining_frac_i)
+        af_padded[i, 0, 7] = np.float32(grow_ratio_scaled_i)
+        af_padded[i, 0, 8] = np.float32(positive_frontier_fraction_i)
+        af_padded[i, 0, 9] = np.float32(centroid_drift_scaled_i)
+        af_padded[i, 0, 10] = np.float32(compactness_proxy_i)
 
         g_batch[i] = np.asarray(
             [
@@ -1971,6 +1953,11 @@ def _collate_minibatch_from_cache(
                 assigned_ll_mean_i,
                 assigned_ll_max_i,
                 remaining_frac_i,
+                float(static.seed_size_scaled),
+                grow_ratio_scaled_i,
+                positive_frontier_fraction_i,
+                centroid_drift_scaled_i,
+                compactness_proxy_i,
             ],
             dtype=np.float32,
         )
@@ -2007,6 +1994,15 @@ def _build_global_feature_batch_from_cache(
     global_batch[:, 3] = rollout_cache.assigned_ll_mean[idx_arr]
     global_batch[:, 4] = rollout_cache.assigned_ll_max[idx_arr]
     global_batch[:, 5] = rollout_cache.remaining_frac[idx_arr]
+    global_batch[:, 6] = np.fromiter(
+        (rollout_cache.episode_static[int(ep)].seed_size_scaled for ep in episode_slot.tolist()),
+        dtype=np.float32,
+        count=n,
+    )
+    global_batch[:, 7] = rollout_cache.grow_ratio_scaled[idx_arr]
+    global_batch[:, 8] = rollout_cache.positive_frontier_fraction[idx_arr]
+    global_batch[:, 9] = rollout_cache.centroid_drift_scaled[idx_arr]
+    global_batch[:, 10] = rollout_cache.compactness_proxy[idx_arr]
     return global_batch, episode_slot
 
 
@@ -2017,95 +2013,18 @@ def _evaluate_minibatch_from_cache_grouped(
     indices: np.ndarray,
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
-    """Evaluate one PPO minibatch without rebuilding dense action feature cubes.
-
-    Exact semantics are preserved:
-    - values still use state/global features
-    - STOP still uses dynamic state features
-    - ADD logits are scored from the same static per-bin features
-    - invalid ADD actions are masked out exactly as before
-    """
-    idx_arr = np.asarray(indices, dtype=np.int64)
-    n = int(idx_arr.size)
-    if n == 0:
-        raise ValueError("cannot evaluate empty minibatch")
-
-    global_batch_np, episode_slot = _build_global_feature_batch_from_cache(idx_arr, rollout_cache)
-    global_t = torch.as_tensor(global_batch_np, device=device, dtype=torch.float32)
-    actions_t = torch.as_tensor(rollout_cache.actions[idx_arr], device=device, dtype=torch.int64)
-    old_log_probs_t = torch.as_tensor(rollout_cache.old_log_probs[idx_arr], device=device, dtype=torch.float32)
-    returns_t = torch.as_tensor(rollout_cache.returns[idx_arr], device=device, dtype=torch.float32)
-    advantages_t = torch.as_tensor(rollout_cache.advantages[idx_arr], device=device, dtype=torch.float32)
-
-    global_latent = model.encode_global(global_t)
-    values = model.value_from_global_latent(global_latent)
-    stop_logits_all = model.stop_logits_from_global_features(global_t)
-
-    new_log_probs = torch.empty((n,), device=device, dtype=torch.float32)
-    entropy_values = torch.empty((n,), device=device, dtype=torch.float32)
-    neg_large = torch.finfo(stop_logits_all.dtype).min
-
-    sort_order = np.argsort(episode_slot, kind="stable")
-    sorted_episode_slot = episode_slot[sort_order]
-    group_starts = np.flatnonzero(
-        np.concatenate([np.asarray([True]), sorted_episode_slot[1:] != sorted_episode_slot[:-1]])
-    )
-    group_ends = np.concatenate([group_starts[1:], np.asarray([len(sort_order)], dtype=np.int64)])
-
-    for group_start, group_end in zip(group_starts.tolist(), group_ends.tolist()):
-        loc_np = sort_order[group_start:group_end]
-        loc_t = torch.as_tensor(loc_np, device=device, dtype=torch.int64)
-        ep = int(sorted_episode_slot[group_start])
-        static = rollout_cache.episode_static[ep]
-
-        stop_logits = stop_logits_all.index_select(0, loc_t)
-        if static.n_bins == 0:
-            masked_logits = stop_logits.unsqueeze(1)
-        else:
-            add_features_t = torch.as_tensor(static.action_template[1:, :], device=device, dtype=torch.float32)
-            add_latent = model.encode_action_features(add_features_t)
-            add_logits = model.policy_logits_from_action_latent(add_latent)
-
-            membership_np = np.stack(
-                [
-                    _unpack_mask(
-                        rollout_cache.packed_membership_masks[int(idx_arr[pos])],
-                        n_bits=static.n_bins,
-                    )
-                    for pos in loc_np.tolist()
-                ],
-                axis=0,
-            )
-            valid_add_mask = torch.as_tensor(membership_np == 0, device=device, dtype=torch.bool)
-            group_size = int(valid_add_mask.shape[0])
-            all_logits = torch.cat(
-                [
-                    stop_logits.unsqueeze(1),
-                    add_logits.unsqueeze(0).expand(group_size, -1),
-                ],
-                dim=1,
-            )
-            all_mask = torch.cat(
-                [
-                    torch.ones((group_size, 1), device=device, dtype=torch.bool),
-                    valid_add_mask,
-                ],
-                dim=1,
-            )
-            masked_logits = all_logits.masked_fill(~all_mask, neg_large)
-
-        dist = Categorical(logits=masked_logits)
-        group_actions = actions_t.index_select(0, loc_t)
-        new_log_probs.index_copy_(0, loc_t, dist.log_prob(group_actions))
-        entropy_values.index_copy_(0, loc_t, dist.entropy())
-
+    """Evaluate one PPO minibatch with exact reconstructed dynamic action features."""
+    batch = _collate_minibatch_from_cache(indices=indices, rollout_cache=rollout_cache, device=device)
+    dist, values = model(batch["global_features"], batch["action_features"], batch["action_mask"])
+    new_log_probs = dist.log_prob(batch["actions"])
+    entropy_values = dist.entropy()
     return {
         "new_log_probs": new_log_probs,
         "values": values,
         "entropy": entropy_values,
-        "old_log_probs": old_log_probs_t,
-        "returns": returns_t,
-        "advantages": advantages_t,
+        "old_log_probs": batch["old_log_probs"],
+        "returns": batch["returns"],
+        "advantages": batch["advantages"],
     }
 
 
@@ -2116,7 +2035,8 @@ def _build_policy_observation_from_state(
     step_index: int,
 ) -> dict[str, np.ndarray]:
     n_bins_scaled = float(np.log1p(ctx.n_bins) / 8.0)
-    static_template = _build_static_action_template(ctx, n_bins_scaled)
+    seed_size_scaled = _scale_seed_size_feature(int(np.sum(ctx.initial_membership_mask)))
+    static_template = _build_static_action_template(ctx, n_bins_scaled, seed_size_scaled)
     mask = np.asarray(membership_mask, dtype=np.uint8)
     summary = _compute_state_summary_from_mask(ctx=ctx, membership_mask=mask, step_index=step_index)
 
@@ -2126,10 +2046,21 @@ def _build_policy_observation_from_state(
     if ctx.n_bins > 0:
         action_features[1:, 5] = mask.astype(np.float32, copy=False)
         action_mask[1:] = compute_frontier_eligible_mask(mask, ctx.neighbor_index)
+        candidate_centroid_distance, candidate_compactness_gain = _compute_dynamic_add_action_features(
+            ctx=ctx,
+            membership_mask=mask,
+            frontier_mask=action_mask[1:],
+        )
+        action_features[1:, 11] = candidate_centroid_distance
+        action_features[1:, 12] = candidate_compactness_gain
     action_features[0, 1] = np.float32(summary["assigned_frac"])
     action_features[0, 2] = np.float32(summary["step_frac"])
     action_features[0, 4] = np.float32(summary["assigned_ll_mean"])
     action_features[0, 5] = np.float32(summary["remaining_frac"])
+    action_features[0, 7] = np.float32(summary["grow_ratio_scaled"])
+    action_features[0, 8] = np.float32(summary["positive_frontier_fraction"])
+    action_features[0, 9] = np.float32(summary["centroid_drift_scaled"])
+    action_features[0, 10] = np.float32(summary["compactness_proxy"])
 
     global_features = np.asarray(
         [
@@ -2139,6 +2070,11 @@ def _build_policy_observation_from_state(
             summary["assigned_ll_mean"],
             summary["assigned_ll_max"],
             summary["remaining_frac"],
+            seed_size_scaled,
+            summary["grow_ratio_scaled"],
+            summary["positive_frontier_fraction"],
+            summary["centroid_drift_scaled"],
+            summary["compactness_proxy"],
         ],
         dtype=np.float32,
     )
@@ -2149,26 +2085,34 @@ def _build_episode_static_policy_features(ctx: EpisodeContext) -> EpisodeStaticP
     """Build per-episode static action template reused for all transitions."""
     n_bins = int(ctx.n_bins)
     n_bins_scaled = float(np.log1p(n_bins) / 8.0)
-    template = _build_static_action_template(ctx, n_bins_scaled)
+    seed_size_scaled = _scale_seed_size_feature(int(np.sum(ctx.initial_membership_mask)))
+    template = _build_static_action_template(ctx, n_bins_scaled, seed_size_scaled)
     return EpisodeStaticPolicyFeatures(
+        context=ctx,
         action_template=template,
         n_bins=n_bins,
         n_bins_scaled=n_bins_scaled,
+        seed_size_scaled=seed_size_scaled,
         max_steps=int(ctx.max_steps),
     )
 
 
-def _build_static_action_template(ctx: EpisodeContext, n_bins_scaled: float) -> np.ndarray:
+def _build_static_action_template(
+    ctx: EpisodeContext,
+    n_bins_scaled: float,
+    seed_size_scaled: float,
+) -> np.ndarray:
     """Build action feature matrix with static columns only.
 
     Dynamic fields are filled per state:
-    - STOP row columns [1, 2, 4, 5]
-    - ADD rows membership column [5]
+    - STOP row columns [1, 2, 4, 5, 7, 8, 9, 10]
+    - ADD rows columns [5, 11, 12]
     """
     n_bins = int(ctx.n_bins)
     template = np.zeros((n_bins + 1, AddStopCellEnv.ACTION_FEATURE_DIM), dtype=np.float32)
     template[0, 0] = np.float32(1.0)
     template[0, 3] = np.float32(n_bins_scaled)
+    template[0, 6] = np.float32(seed_size_scaled)
     if n_bins > 0:
         template[1:, 0] = np.float32(0.0)
         template[1:, 1] = ctx.ll_mean_z.astype(np.float32, copy=False)
@@ -2207,13 +2151,171 @@ def _compute_state_summary_from_mask(
         assigned_ll_mean = 0.0
         assigned_ll_max = 0.0
 
+    initial_seed_count = int(np.sum(ctx.initial_membership_mask))
+    grow_ratio_scaled = _scale_grow_ratio_feature(assigned_count, initial_seed_count)
+    positive_frontier_fraction, centroid_drift_scaled, compactness_proxy = _compute_shape_frontier_features(
+        ctx=ctx,
+        membership_mask=mask,
+    )
+
     return {
         "assigned_frac": assigned_frac,
         "step_frac": step_frac,
         "remaining_frac": remaining_frac,
+        "grow_ratio_scaled": grow_ratio_scaled,
+        "positive_frontier_fraction": positive_frontier_fraction,
+        "centroid_drift_scaled": centroid_drift_scaled,
+        "compactness_proxy": compactness_proxy,
         "assigned_ll_mean": assigned_ll_mean,
         "assigned_ll_max": assigned_ll_max,
     }
+
+
+def _compute_shape_frontier_features(
+    *,
+    ctx: EpisodeContext,
+    membership_mask: np.ndarray,
+) -> tuple[float, float, float]:
+    """Compute dynamic shape/frontier summaries used by STOP/value features."""
+    mask = np.asarray(membership_mask, dtype=np.uint8)
+    assigned = mask.astype(bool, copy=False)
+    assigned_count = int(np.sum(assigned))
+
+    neighbor_support = compute_neighbor_support_fraction(mask, ctx.neighbor_index)
+
+    if assigned_count > 0:
+        compactness_proxy = float(np.mean(neighbor_support[assigned]))
+        centroid_xy = np.mean(ctx.candidate_bin_xy_um[assigned], axis=0, dtype=np.float64)
+        drift_um = float(np.sqrt(np.sum((centroid_xy - ctx.nucleus_center_xy_um) ** 2)))
+        centroid_drift_scaled = float(min(max(drift_um / max(float(ctx.r_max_um), 1.0e-8), 0.0), 1.0))
+    else:
+        compactness_proxy = 0.0
+        centroid_drift_scaled = 0.0
+
+    frontier = compute_frontier_eligible_mask(mask, ctx.neighbor_index)
+    if np.any(frontier):
+        posterior = _posterior_from_membership_mask(ctx=ctx, membership_mask=mask)
+        add_rewards = _add_rewards_from_membership_mask(
+            ctx=ctx,
+            membership_mask=mask,
+            posterior=posterior,
+            neighbor_support=neighbor_support,
+            frontier_mask=frontier,
+        )
+        positive_frontier_fraction = float(np.mean(add_rewards[frontier] > 0.0))
+    else:
+        positive_frontier_fraction = 0.0
+
+    return positive_frontier_fraction, centroid_drift_scaled, compactness_proxy
+
+
+def _compute_dynamic_add_action_features(
+    *,
+    ctx: EpisodeContext,
+    membership_mask: np.ndarray,
+    frontier_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute dynamic per-candidate ADD features from the current mask.
+
+    Returns
+    -------
+    candidate_to_current_centroid_distance:
+        Distance from each frontier bin to the current assigned centroid, scaled by
+        ``r_max_um`` and clipped to ``[0, 1]``.
+    candidate_compactness_gain:
+        Change in compactness proxy if that frontier bin were added next.
+    """
+    n_bins = int(ctx.n_bins)
+    candidate_to_current_centroid_distance = np.zeros((n_bins,), dtype=np.float32)
+    candidate_compactness_gain = np.zeros((n_bins,), dtype=np.float32)
+    if n_bins == 0:
+        return candidate_to_current_centroid_distance, candidate_compactness_gain
+
+    mask = np.asarray(membership_mask, dtype=np.uint8)
+    assigned = mask.astype(bool, copy=False)
+    assigned_count = int(np.sum(assigned))
+    if frontier_mask is None:
+        frontier = compute_frontier_eligible_mask(mask, ctx.neighbor_index)
+    else:
+        frontier = np.asarray(frontier_mask, dtype=bool)
+        if frontier.shape != (n_bins,):
+            raise ValueError(f"frontier_mask shape mismatch: expected {(n_bins,)}, got {frontier.shape}")
+
+    if assigned_count > 0:
+        current_centroid_xy = np.mean(ctx.candidate_bin_xy_um[assigned], axis=0, dtype=np.float64)
+    else:
+        current_centroid_xy = np.asarray(ctx.nucleus_center_xy_um, dtype=np.float64)
+
+    if np.any(frontier):
+        xy = np.asarray(ctx.candidate_bin_xy_um, dtype=np.float64)
+        centroid_dist_um = np.sqrt(np.sum((xy - current_centroid_xy) ** 2, axis=1))
+        scaled_dist = centroid_dist_um / max(float(ctx.r_max_um), 1.0e-8)
+        candidate_to_current_centroid_distance[frontier] = np.clip(scaled_dist[frontier], 0.0, 1.0).astype(
+            np.float32,
+            copy=False,
+        )
+
+        neighbor_support = compute_neighbor_support_fraction(mask, ctx.neighbor_index)
+        if assigned_count > 0:
+            current_compactness_sum = float(np.sum(neighbor_support[assigned], dtype=np.float64))
+            current_compactness = current_compactness_sum / float(assigned_count)
+            new_compactness = (current_compactness_sum + 2.0 * neighbor_support) / float(assigned_count + 1)
+            gains = new_compactness - current_compactness
+            candidate_compactness_gain[frontier] = gains[frontier].astype(np.float32, copy=False)
+
+    return candidate_to_current_centroid_distance, candidate_compactness_gain
+
+
+def _posterior_from_membership_mask(
+    *,
+    ctx: EpisodeContext,
+    membership_mask: np.ndarray,
+) -> np.ndarray:
+    """Compute posterior p(k|S_t) from current assigned membership."""
+    mask = np.asarray(membership_mask, dtype=np.uint8).astype(bool, copy=False)
+    if np.any(mask):
+        log_p_st_given_k = np.sum(ctx.ll[mask], axis=0, dtype=np.float64)
+    else:
+        log_p_st_given_k = np.zeros((ctx.n_cell_types,), dtype=np.float64)
+    return _softmax_1d(log_p_st_given_k + ctx.log_prior)
+
+
+def _add_rewards_from_membership_mask(
+    *,
+    ctx: EpisodeContext,
+    membership_mask: np.ndarray,
+    posterior: np.ndarray,
+    neighbor_support: np.ndarray,
+    frontier_mask: np.ndarray,
+) -> np.ndarray:
+    """Recompute current ADD rewards from one state summary path."""
+    del membership_mask
+    r_expr = (ctx.ll @ posterior) * ctx.expression_confidence
+    if ctx.normalize_expression_zscore:
+        if np.any(frontier_mask):
+            expr_frontier = r_expr[frontier_mask]
+            mu = float(np.mean(expr_frontier))
+            sigma = float(np.std(expr_frontier, ddof=0))
+            expr_term = (r_expr - mu) / (sigma + float(ctx.zscore_delta))
+        else:
+            expr_term = np.zeros_like(r_expr, dtype=np.float32)
+    else:
+        expr_term = r_expr
+    return ctx.w1 * expr_term - ctx.base_penalty + ctx.w4 * neighbor_support
+
+
+def _scale_seed_size_feature(seed_count: int, *, cap: int = 32) -> float:
+    """Map initial nuclear seed size into a stable [0, 1] feature range."""
+    capped = float(min(max(int(seed_count), 0), int(cap)))
+    return float(np.log1p(capped) / np.log1p(float(cap)))
+
+
+def _scale_grow_ratio_feature(assigned_count: int, initial_seed_count: int, *, cap: float = 8.0) -> float:
+    """Map current growth ratio assigned/seed into a stable [0, 1] feature range."""
+    denom = max(int(initial_seed_count), 1)
+    ratio = float(max(int(assigned_count), 0)) / float(denom)
+    capped = min(max(ratio, 0.0), float(cap))
+    return float(np.log1p(capped) / np.log1p(float(cap)))
 
 
 def _observation_to_tensors(obs: dict[str, Any], *, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

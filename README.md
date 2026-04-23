@@ -1,4 +1,4 @@
-# Human Colorectal Runbook
+# Bin2cell RL Runbook
 
 This runbook lists the execution order for preprocessing, episode building, reward search, weight selection, and fixed-weight evaluation.
 Each step depends on outputs from earlier steps, so run in order unless you already have the required files.

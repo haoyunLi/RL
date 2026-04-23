@@ -29,6 +29,7 @@ reward:
   objective: gt_shape
   epsilon: 1.0e-8
   r_max_um: 20.0
+  expression_confidence_pseudocount: 5.0
   normalize_expression_zscore: true
   zscore_delta: 1.0e-8
   w4: 0.0

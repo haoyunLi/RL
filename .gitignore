@@ -5,6 +5,7 @@ __pycache__/
 *.pyd
 *.codex
 .pytest_cache/
+cache/
 
 # Experiment and run artifacts
 runs/
@@ -13,6 +14,8 @@ workspace_outputs/
 # Local conda/venv-style environments in repo
 cellpose/
 Bin2Cell_Validation/
+bin2cell_env/
+smurf/
 
 # Scheduler and log outputs
 *.out

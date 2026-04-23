@@ -5,9 +5,9 @@
 #SBATCH --time=72:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=128
+#SBATCH --cpus-per-task=96
 #SBATCH --hint=nomultithread
-#SBATCH --mem=900G
+#SBATCH --mem=800G
 #SBATCH --output=ppo_training_cpu.out
 #SBATCH --error=ppo_training_cpu.err
 
