@@ -77,6 +77,7 @@ class PPOTrainingConfig:
     expression_cache_size: int | None
 
     gamma: float
+    gae_lambda: float
     normalize_returns_per_episode: bool
     normalize_advantages: bool
     eps_clip: float
@@ -89,6 +90,12 @@ class PPOTrainingConfig:
     max_grad_norm: float
     hidden_dim: int
     target_kl: float | None
+
+    group_relative_enabled: bool
+    group_relative_group_size: int
+    group_relative_mix_alpha: float
+    group_relative_norm_epsilon: float
+    group_relative_score: str
 
     epsilon: float
     r_max_um: float
@@ -138,6 +145,7 @@ class PPOTrainingConfig:
             },
             "ppo": {
                 "gamma": self.gamma,
+                "gae_lambda": self.gae_lambda,
                 "normalize_returns_per_episode": self.normalize_returns_per_episode,
                 "normalize_advantages": self.normalize_advantages,
                 "eps_clip": self.eps_clip,
@@ -150,6 +158,13 @@ class PPOTrainingConfig:
                 "max_grad_norm": self.max_grad_norm,
                 "hidden_dim": self.hidden_dim,
                 "target_kl": self.target_kl,
+            },
+            "group_relative": {
+                "enabled": self.group_relative_enabled,
+                "group_size": self.group_relative_group_size,
+                "mix_alpha": self.group_relative_mix_alpha,
+                "norm_epsilon": self.group_relative_norm_epsilon,
+                "score": self.group_relative_score,
             },
             "reward": {
                 "epsilon": self.epsilon,
@@ -950,6 +965,40 @@ def compute_discounted_returns(rewards: np.ndarray, gamma: float) -> np.ndarray:
     return out
 
 
+def compute_gae_returns_and_advantages(
+    rewards: np.ndarray,
+    values: np.ndarray,
+    dones: np.ndarray,
+    *,
+    gamma: float,
+    gae_lambda: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute GAE(lambda) advantages and returns for one episode."""
+    r = np.asarray(rewards, dtype=np.float64)
+    v = np.asarray(values, dtype=np.float64)
+    d = np.asarray(dones, dtype=bool)
+    if r.ndim != 1 or v.ndim != 1 or d.ndim != 1:
+        raise ValueError("rewards, values, and dones must be 1D arrays")
+    if r.shape != v.shape or r.shape != d.shape:
+        raise ValueError("rewards, values, and dones must have the same shape")
+    if not (0.0 < gamma <= 1.0):
+        raise ValueError("gamma must be in (0, 1]")
+    if not (0.0 <= gae_lambda <= 1.0):
+        raise ValueError("gae_lambda must be in [0, 1]")
+
+    advantages = np.zeros_like(r, dtype=np.float64)
+    gae = 0.0
+    next_value = 0.0
+    for i in range(len(r) - 1, -1, -1):
+        nonterminal = 0.0 if bool(d[i]) else 1.0
+        delta = float(r[i]) + float(gamma) * next_value * nonterminal - float(v[i])
+        gae = delta + float(gamma) * float(gae_lambda) * nonterminal * gae
+        advantages[i] = gae
+        next_value = float(v[i])
+    returns = advantages + v
+    return returns, advantages
+
+
 def compute_advantages(returns: np.ndarray, values: np.ndarray) -> np.ndarray:
     """Compute advantages as A_t = R_t - V(s_t)."""
     ret = np.asarray(returns, dtype=np.float64)
@@ -957,6 +1006,33 @@ def compute_advantages(returns: np.ndarray, values: np.ndarray) -> np.ndarray:
     if ret.shape != val.shape:
         raise ValueError("returns and values must have same shape")
     return ret - val
+
+
+def _compute_group_relative_episode_advantages(
+    trajectories: list["EpisodeTrajectory"],
+    *,
+    group_size: int,
+    norm_epsilon: float,
+    score: str,
+) -> np.ndarray:
+    """Compute one standardized same-cell scalar per trajectory."""
+    if group_size <= 1:
+        raise ValueError("group_size must be > 1")
+    if norm_epsilon <= 0:
+        raise ValueError("norm_epsilon must be > 0")
+    if score != "episode_total_reward":
+        raise ValueError(f"unsupported group-relative score: {score!r}")
+    if len(trajectories) % int(group_size) != 0:
+        raise ValueError("trajectory count must be divisible by group_size")
+
+    bonuses = np.zeros((len(trajectories),), dtype=np.float64)
+    for start in range(0, len(trajectories), int(group_size)):
+        stop = start + int(group_size)
+        scores = np.asarray([trajectories[i].total_reward for i in range(start, stop)], dtype=np.float64)
+        mu = float(np.mean(scores))
+        sigma = float(np.std(scores, ddof=0))
+        bonuses[start:stop] = (scores - mu) / (sigma + float(norm_epsilon))
+    return bonuses
 
 
 def ppo_update(
@@ -1054,11 +1130,21 @@ def train_one_update(
     t_start = time.perf_counter()
 
     t0 = time.perf_counter()
+    sampled_cells = (
+        int(config.batch_cells) // int(config.group_relative_group_size)
+        if bool(config.group_relative_enabled)
+        else int(config.batch_cells)
+    )
     contexts = _collect_episode_contexts(
         dataset=dataset,
-        batch_cells=int(config.batch_cells),
+        batch_cells=sampled_cells,
         max_steps_per_episode=config.max_steps_per_episode,
     )
+    if bool(config.group_relative_enabled):
+        contexts = _expand_group_relative_contexts(
+            contexts=contexts,
+            group_size=int(config.group_relative_group_size),
+        )
     t_context = time.perf_counter() - t0
     if not contexts:
         raise RuntimeError("failed to collect any valid trajectories for this update")
@@ -1080,8 +1166,14 @@ def train_one_update(
     transitions = _build_rollout_buffer(
         trajectories=trajectories,
         gamma=float(config.gamma),
+        gae_lambda=float(config.gae_lambda),
         normalize_returns_per_episode=bool(config.normalize_returns_per_episode),
         normalize_advantages=bool(config.normalize_advantages),
+        group_relative_enabled=bool(config.group_relative_enabled),
+        group_relative_group_size=int(config.group_relative_group_size),
+        group_relative_mix_alpha=float(config.group_relative_mix_alpha),
+        group_relative_norm_epsilon=float(config.group_relative_norm_epsilon),
+        group_relative_score=str(config.group_relative_score),
     )
     t_buffer = time.perf_counter() - t0
 
@@ -1150,6 +1242,20 @@ def _collect_episode_contexts(
             if len(contexts) >= int(batch_cells):
                 break
     return contexts
+
+
+def _expand_group_relative_contexts(
+    *,
+    contexts: list[EpisodeContext],
+    group_size: int,
+) -> list[EpisodeContext]:
+    """Duplicate sampled contexts contiguously for grouped rollouts."""
+    if group_size <= 1:
+        raise ValueError("group_size must be > 1")
+    expanded: list[EpisodeContext] = []
+    for ctx in contexts:
+        expanded.extend([ctx] * int(group_size))
+    return expanded
 
 
 def _collect_trajectories(
@@ -1398,6 +1504,10 @@ def run_ppo_training(config: PPOTrainingConfig) -> PPOTrainingResult:
             "n_cells_total": int(dataset.n_cells),
             "rollout_mode": str(config.rollout_mode),
             "n_rollout_workers": int(config.n_rollout_workers),
+            "gae_lambda": float(config.gae_lambda),
+            "group_relative_enabled": bool(config.group_relative_enabled),
+            "group_relative_group_size": int(config.group_relative_group_size),
+            "group_relative_mix_alpha": float(config.group_relative_mix_alpha),
             "torch_num_threads": int(torch.get_num_threads()),
             "torch_num_interop_threads": int(torch.get_num_interop_threads()),
         },
@@ -1475,6 +1585,10 @@ def run_ppo_training(config: PPOTrainingConfig) -> PPOTrainingResult:
                     "n_transitions": row.n_transitions,
                     "best_moving_avg_reward": best_moving_avg,
                     "checkpoint_saved": bool(improved),
+                    "gae_lambda": float(config.gae_lambda),
+                    "group_relative_enabled": bool(config.group_relative_enabled),
+                    "group_relative_group_size": int(config.group_relative_group_size),
+                    "group_relative_mix_alpha": float(config.group_relative_mix_alpha),
                     "time_context_sec": float(timing["time_context_sec"]),
                     "time_rollout_sec": float(timing["time_rollout_sec"]),
                     "time_buffer_sec": float(timing["time_buffer_sec"]),
@@ -1618,6 +1732,9 @@ def load_ppo_training_config(config_path: str | Path) -> PPOTrainingConfig:
     gamma = float(ppo.get("gamma", 0.99))
     if not (0.0 < gamma <= 1.0):
         raise ConfigError("ppo.gamma must be in (0, 1]")
+    gae_lambda = float(ppo.get("gae_lambda", 0.95))
+    if not (0.0 <= gae_lambda <= 1.0):
+        raise ConfigError("ppo.gae_lambda must be in [0, 1]")
     normalize_returns_per_episode = bool(ppo.get("normalize_returns_per_episode", True))
     normalize_advantages = bool(ppo.get("normalize_advantages", True))
     eps_clip = float(ppo.get("eps_clip", 0.2))
@@ -1651,6 +1768,23 @@ def load_ppo_training_config(config_path: str | Path) -> PPOTrainingConfig:
     target_kl = None if target_kl_raw is None else float(target_kl_raw)
     if target_kl is not None and target_kl <= 0:
         raise ConfigError("ppo.target_kl must be > 0 when provided")
+
+    group_relative = _as_dict(raw.get("group_relative", {}), "group_relative")
+    group_relative_enabled = bool(group_relative.get("enabled", False))
+    group_relative_group_size = int(group_relative.get("group_size", 4))
+    if group_relative_group_size <= 1:
+        raise ConfigError("group_relative.group_size must be > 1")
+    group_relative_mix_alpha = float(group_relative.get("mix_alpha", 0.3))
+    if not (0.0 <= group_relative_mix_alpha <= 1.0):
+        raise ConfigError("group_relative.mix_alpha must be in [0, 1]")
+    group_relative_norm_epsilon = float(group_relative.get("norm_epsilon", 1.0e-6))
+    if group_relative_norm_epsilon <= 0:
+        raise ConfigError("group_relative.norm_epsilon must be > 0")
+    group_relative_score = str(group_relative.get("score", "episode_total_reward")).strip().lower()
+    if group_relative_score != "episode_total_reward":
+        raise ConfigError("group_relative.score must be 'episode_total_reward'")
+    if group_relative_enabled and batch_cells % group_relative_group_size != 0:
+        raise ConfigError("run.batch_cells must be divisible by group_relative.group_size when enabled")
 
     epsilon = float(reward.get("epsilon", 1e-8))
     if epsilon < 0:
@@ -1712,6 +1846,7 @@ def load_ppo_training_config(config_path: str | Path) -> PPOTrainingConfig:
         nuclei_columns=nuclei_columns,
         expression_cache_size=expression_cache_size,
         gamma=gamma,
+        gae_lambda=gae_lambda,
         normalize_returns_per_episode=normalize_returns_per_episode,
         normalize_advantages=normalize_advantages,
         eps_clip=eps_clip,
@@ -1724,6 +1859,11 @@ def load_ppo_training_config(config_path: str | Path) -> PPOTrainingConfig:
         max_grad_norm=max_grad_norm,
         hidden_dim=hidden_dim,
         target_kl=target_kl,
+        group_relative_enabled=group_relative_enabled,
+        group_relative_group_size=group_relative_group_size,
+        group_relative_mix_alpha=group_relative_mix_alpha,
+        group_relative_norm_epsilon=group_relative_norm_epsilon,
+        group_relative_score=group_relative_score,
         epsilon=epsilon,
         r_max_um=r_max_um,
         w1=w1,
@@ -1746,17 +1886,44 @@ def _build_rollout_buffer(
     *,
     trajectories: list[EpisodeTrajectory],
     gamma: float,
+    gae_lambda: float,
     normalize_returns_per_episode: bool,
     normalize_advantages: bool,
+    group_relative_enabled: bool,
+    group_relative_group_size: int,
+    group_relative_mix_alpha: float,
+    group_relative_norm_epsilon: float,
+    group_relative_score: str,
 ) -> list[RolloutTransition]:
     out: list[RolloutTransition] = []
-    for traj in trajectories:
+    group_relative_bonus = (
+        _compute_group_relative_episode_advantages(
+            trajectories,
+            group_size=int(group_relative_group_size),
+            norm_epsilon=float(group_relative_norm_epsilon),
+            score=str(group_relative_score),
+        )
+        if group_relative_enabled and trajectories
+        else None
+    )
+    for traj_idx, traj in enumerate(trajectories):
         rewards = np.asarray([s.reward for s in traj.steps], dtype=np.float64)
         values = np.asarray([s.old_value for s in traj.steps], dtype=np.float64)
-        returns = compute_discounted_returns(rewards, gamma=gamma)
+        dones = np.asarray([s.done for s in traj.steps], dtype=bool)
+        returns, advantages = compute_gae_returns_and_advantages(
+            rewards,
+            values,
+            dones,
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+        )
         if normalize_returns_per_episode and returns.size > 1:
             returns = _zscore_1d(returns)
-        advantages = compute_advantages(returns, values)
+        if group_relative_bonus is not None:
+            advantages = (
+                (1.0 - float(group_relative_mix_alpha)) * advantages
+                + float(group_relative_mix_alpha) * float(group_relative_bonus[traj_idx])
+            )
         for i, step in enumerate(traj.steps):
             out.append(
                 RolloutTransition(

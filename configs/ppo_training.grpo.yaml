@@ -1,5 +1,5 @@
 run:
-  name: human_colorectal_ppo
+  name: human_colorectal_grpo
   output_root: runs
   seed: 7
   device: auto
@@ -50,7 +50,7 @@ ppo:
   target_kl: 0.01
 
 group_relative:
-  enabled: false
+  enabled: true
   group_size: 4
   mix_alpha: 0.3
   norm_epsilon: 1.0e-6
@@ -64,7 +64,7 @@ reward:
   w3: 1.0
   w4: 0.05
   stop_lambda: 0.7
-  stop_stat: topk_mean # or using max for old logic 
+  stop_stat: topk_mean # or using max for old logic
   stop_top_k: 5
   expression_confidence_pseudocount: 5.0
   normalize_expression_zscore: true
