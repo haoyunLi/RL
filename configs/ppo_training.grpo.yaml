@@ -12,6 +12,7 @@ run:
   n_rollout_workers: 32
   max_updates: 600
   max_steps_per_episode: null
+  training_mode: ppo
 
 inputs:
   # This is auto-updated by jobs/run_ppo_training_cpu.sbatch and jobs/run_ppo_training_gpu.sbatch.
@@ -55,6 +56,20 @@ group_relative:
   mix_alpha: 0.3
   norm_epsilon: 1.0e-6
   score: episode_total_reward
+
+full_grpo:
+  reward_weight: 1.0
+  size_weight: 0.8
+  stop_weight: 0.4
+  compact_weight: 0.2
+  small_over_weight: 1.2
+  large_under_weight: 1.2
+  small_seed_max: 8
+  large_seed_min: 17
+  targets:
+    small: [1.4, 2.4]
+    medium: [1.6, 2.8]
+    large: [1.8, 3.4]
 
 reward:
   epsilon: 1.0e-8

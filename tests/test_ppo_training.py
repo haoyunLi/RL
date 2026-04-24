@@ -14,7 +14,9 @@ from hd_cell_rl.ppo_training import (
     EpisodeStep,
     EpisodeTrajectory,
     _build_rollout_buffer,
+    _compute_full_grpo_episode_scores,
     _compute_group_relative_episode_advantages,
+    _full_grpo_size_score,
     compute_discounted_returns,
     compute_gae_returns_and_advantages,
     load_ppo_training_config,
@@ -124,6 +126,103 @@ class PPOTrainingTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 load_ppo_training_config(config_path)
 
+    def test_full_grpo_size_score_penalizes_targeted_size_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = self._write_minimal_config(
+                Path(tmp_dir),
+                batch_cells=2,
+                group_relative_enabled=True,
+                training_mode="full_grpo",
+            )
+            config = load_ppo_training_config(config_path)
+
+        small_over = _full_grpo_size_score(
+            grow_ratio=4.0,
+            lower=1.4,
+            upper=2.4,
+            bucket="small",
+            config=config,
+        )
+        medium_over = _full_grpo_size_score(
+            grow_ratio=4.0,
+            lower=1.6,
+            upper=2.8,
+            bucket="medium",
+            config=config,
+        )
+        large_under = _full_grpo_size_score(
+            grow_ratio=0.5,
+            lower=1.8,
+            upper=3.4,
+            bucket="large",
+            config=config,
+        )
+        medium_under = _full_grpo_size_score(
+            grow_ratio=0.5,
+            lower=1.6,
+            upper=2.8,
+            bucket="medium",
+            config=config,
+        )
+
+        self.assertLess(small_over, medium_over)
+        self.assertLess(large_under, medium_under)
+
+    def test_full_grpo_scores_use_size_aware_terminal_objective(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            config_path = self._write_minimal_config(
+                root,
+                batch_cells=2,
+                group_relative_enabled=True,
+                training_mode="full_grpo",
+            )
+            config = load_ppo_training_config(config_path)
+            ctx = self._minimal_episode_context(config)
+            stop_step = EpisodeStep(
+                packed_membership_mask=np.zeros((1,), dtype=np.uint8),
+                step_index=0,
+                action=0,
+                reward=0.0,
+                done=True,
+                old_log_prob=-0.5,
+                old_value=0.0,
+            )
+            add_step = EpisodeStep(
+                packed_membership_mask=np.zeros((1,), dtype=np.uint8),
+                step_index=0,
+                action=1,
+                reward=0.0,
+                done=True,
+                old_log_prob=-0.5,
+                old_value=0.0,
+            )
+            scores = _compute_full_grpo_episode_scores(
+                [
+                    EpisodeTrajectory(episode_slot=0, steps=(stop_step,), total_reward=0.0),
+                    EpisodeTrajectory(episode_slot=1, steps=(add_step,), total_reward=0.0),
+                ],
+                [ctx, ctx],
+                config,
+            )
+            self.assertEqual(scores.shape, (2,))
+            self.assertTrue(np.isfinite(scores).all())
+
+    def test_run_ppo_training_smoke_with_full_grpo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            config_path = self._write_minimal_config(
+                root,
+                batch_cells=2,
+                group_relative_enabled=True,
+                training_mode="full_grpo",
+            )
+
+            result = run_ppo_training_from_config(config_path)
+
+            self.assertTrue((result.run_dir / "summary.json").exists())
+            self.assertTrue((result.run_dir / "checkpoints" / "final_model.pt").exists())
+
     def test_run_ppo_training_smoke_with_group_relative(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -147,6 +246,7 @@ class PPOTrainingTests(unittest.TestCase):
         *,
         batch_cells: int,
         group_relative_enabled: bool,
+        training_mode: str = "ppo",
     ) -> Path:
         episodes_dir = root / "episodes"
         episodes_dir.mkdir(parents=True, exist_ok=True)
@@ -200,6 +300,7 @@ class PPOTrainingTests(unittest.TestCase):
                 "n_rollout_workers": 1,
                 "max_updates": 1,
                 "max_steps_per_episode": 2,
+                "training_mode": training_mode,
             },
             "inputs": {
                 "episodes_index_path": str(episodes_index_path),
@@ -242,6 +343,21 @@ class PPOTrainingTests(unittest.TestCase):
                 "norm_epsilon": 1.0e-6,
                 "score": "episode_total_reward",
             },
+            "full_grpo": {
+                "reward_weight": 1.0,
+                "size_weight": 0.8,
+                "stop_weight": 0.4,
+                "compact_weight": 0.2,
+                "small_over_weight": 1.2,
+                "large_under_weight": 1.2,
+                "small_seed_max": 8,
+                "large_seed_min": 17,
+                "targets": {
+                    "small": [1.4, 2.4],
+                    "medium": [1.6, 2.8],
+                    "large": [1.8, 3.4],
+                },
+            },
             "reward": {
                 "epsilon": 1.0e-8,
                 "r_max_um": 20.0,
@@ -266,6 +382,38 @@ class PPOTrainingTests(unittest.TestCase):
         with config_path.open("w", encoding="utf-8") as handle:
             yaml.safe_dump(config, handle, sort_keys=False)
         return config_path
+
+    def _minimal_episode_context(self, config):
+        from hd_cell_rl.ppo_training import EpisodeContext
+
+        return EpisodeContext(
+            cell_id="cell_1",
+            candidate_bin_ids=("bin_0", "bin_1"),
+            initial_membership_mask=np.asarray([1, 0], dtype=np.uint8),
+            candidate_bin_xy_um=np.asarray([[0.0, 0.0], [2.0, 0.0]], dtype=np.float32),
+            nucleus_center_xy_um=np.asarray([0.0, 0.0], dtype=np.float32),
+            ll=np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
+            p_dis=np.asarray([0.0, 0.1], dtype=np.float32),
+            p_overlap=np.asarray([0.0, 0.0], dtype=np.float32),
+            ll_mean_z=np.asarray([0.5, -0.5], dtype=np.float32),
+            ll_max_z=np.asarray([0.5, -0.5], dtype=np.float32),
+            base_penalty=np.asarray([0.0, 0.1], dtype=np.float32),
+            expression_confidence=np.asarray([1.0, 1.0], dtype=np.float32),
+            neighbor_index=np.asarray([[-1, -1, -1, -1, 1, -1, -1, -1], [-1, -1, -1, 0, -1, -1, -1, -1]], dtype=np.int32),
+            max_steps=2,
+            log_prior=-np.log(2.0),
+            r_max_um=float(config.r_max_um),
+            w1=float(config.w1),
+            w2=float(config.w2),
+            w3=float(config.w3),
+            w4=float(config.w4),
+            stop_lambda=float(config.stop_lambda),
+            stop_stat=str(config.stop_stat),
+            stop_top_k=int(config.stop_top_k),
+            expression_confidence_pseudocount=float(config.expression_confidence_pseudocount),
+            normalize_expression_zscore=bool(config.normalize_expression_zscore),
+            zscore_delta=float(config.zscore_delta),
+        )
 
 
 if __name__ == "__main__":

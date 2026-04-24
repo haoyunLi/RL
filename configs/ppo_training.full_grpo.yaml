@@ -1,21 +1,16 @@
 run:
-  name: human_colorectal_ppo
+  name: human_colorectal_full_grpo
   output_root: runs
   seed: 7
   device: auto
   batch_cells: 200
-  # Rollout mode:
-  # - vectorized: one batched forward across active envs each step (recommended)
-  # - legacy: per-env threaded rollout
   rollout_mode: vectorized
-  # Used only by rollout_mode=legacy.
   n_rollout_workers: 32
   max_updates: 600
   max_steps_per_episode: null
-  training_mode: ppo
+  training_mode: full_grpo
 
 inputs:
-  # This is auto-updated by jobs/run_ppo_training_cpu.sbatch and jobs/run_ppo_training_gpu.sbatch.
   episodes_index_path: runs/example_episode_build_run/episodes_index.csv
   reference:
     path: workspace_outputs/pseudo_human_colorectal/intermediate/reference_sct/reference_counts_sct_tumor_aligned_hd_overlap_unique.npz
@@ -29,31 +24,28 @@ inputs:
       cell_id: cell_id
       center_x_um: center_x_um
       center_y_um: center_y_um
-  # Optional override for matrix-column expression loader cache.
-  # If null, value from episodes run config is reused.
   expression_cache_size: null
 
 ppo:
   gamma: 0.99
   gae_lambda: 0.95
-  normalize_returns_per_episode: true
-  normalize_advantages: true
+  normalize_returns_per_episode: false
+  normalize_advantages: false
   eps_clip: 0.2
   ppo_epochs: 4
   minibatch_size: 512
   learning_rate: 1.0e-4
   weight_decay: 0.0
-  vf_coef: 0.5
+  vf_coef: 0.0
   ent_coef: 0.008
   max_grad_norm: 1.0
   hidden_dim: 256
-  # Optional KL guardrail for PPO inner epochs.
   target_kl: 0.01
 
 group_relative:
-  enabled: false
+  enabled: true
   group_size: 4
-  mix_alpha: 0.3
+  mix_alpha: 1.0
   norm_epsilon: 1.0e-6
   score: episode_total_reward
 
@@ -79,7 +71,7 @@ reward:
   w3: 1.0
   w4: 0.05
   stop_lambda: 0.7
-  stop_stat: topk_mean # or using max for old logic 
+  stop_stat: topk_mean
   stop_top_k: 5
   expression_confidence_pseudocount: 5.0
   normalize_expression_zscore: true

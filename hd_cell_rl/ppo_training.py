@@ -65,6 +65,7 @@ class PPOTrainingConfig:
     n_rollout_workers: int
     max_updates: int
     max_steps_per_episode: int | None
+    training_mode: str
 
     episodes_index_path: Path
     reference_path: Path
@@ -97,6 +98,21 @@ class PPOTrainingConfig:
     group_relative_norm_epsilon: float
     group_relative_score: str
 
+    full_grpo_reward_weight: float
+    full_grpo_size_weight: float
+    full_grpo_stop_weight: float
+    full_grpo_compact_weight: float
+    full_grpo_small_over_weight: float
+    full_grpo_large_under_weight: float
+    full_grpo_small_seed_max: int
+    full_grpo_large_seed_min: int
+    full_grpo_small_target_min: float
+    full_grpo_small_target_max: float
+    full_grpo_medium_target_min: float
+    full_grpo_medium_target_max: float
+    full_grpo_large_target_min: float
+    full_grpo_large_target_max: float
+
     epsilon: float
     r_max_um: float
     w1: float
@@ -127,6 +143,7 @@ class PPOTrainingConfig:
                 "n_rollout_workers": self.n_rollout_workers,
                 "max_updates": self.max_updates,
                 "max_steps_per_episode": self.max_steps_per_episode,
+                "training_mode": self.training_mode,
             },
             "inputs": {
                 "episodes_index_path": str(self.episodes_index_path),
@@ -165,6 +182,21 @@ class PPOTrainingConfig:
                 "mix_alpha": self.group_relative_mix_alpha,
                 "norm_epsilon": self.group_relative_norm_epsilon,
                 "score": self.group_relative_score,
+            },
+            "full_grpo": {
+                "reward_weight": self.full_grpo_reward_weight,
+                "size_weight": self.full_grpo_size_weight,
+                "stop_weight": self.full_grpo_stop_weight,
+                "compact_weight": self.full_grpo_compact_weight,
+                "small_over_weight": self.full_grpo_small_over_weight,
+                "large_under_weight": self.full_grpo_large_under_weight,
+                "small_seed_max": self.full_grpo_small_seed_max,
+                "large_seed_min": self.full_grpo_large_seed_min,
+                "targets": {
+                    "small": [self.full_grpo_small_target_min, self.full_grpo_small_target_max],
+                    "medium": [self.full_grpo_medium_target_min, self.full_grpo_medium_target_max],
+                    "large": [self.full_grpo_large_target_min, self.full_grpo_large_target_max],
+                },
             },
             "reward": {
                 "epsilon": self.epsilon,
@@ -1035,6 +1067,149 @@ def _compute_group_relative_episode_advantages(
     return bonuses
 
 
+def _compute_full_grpo_episode_scores(
+    trajectories: list["EpisodeTrajectory"],
+    episode_contexts: list[EpisodeContext],
+    config: PPOTrainingConfig,
+) -> np.ndarray:
+    """Compute no-GT terminal scores used for strict full-GRPO ranking."""
+    scores = np.zeros((len(trajectories),), dtype=np.float64)
+    for i, traj in enumerate(trajectories):
+        ctx = episode_contexts[int(traj.episode_slot)]
+        final_mask = _final_membership_mask_from_trajectory(ctx=ctx, trajectory=traj)
+        assigned_count = int(np.sum(final_mask))
+        seed_count = max(1, int(np.sum(ctx.initial_membership_mask)))
+        grow_ratio = float(assigned_count / seed_count)
+        lower, upper, bucket = _full_grpo_size_target_interval(seed_count, config)
+
+        mean_step_reward = float(traj.total_reward / max(1, len(traj.steps)))
+        size_score = _full_grpo_size_score(
+            grow_ratio=grow_ratio,
+            lower=lower,
+            upper=upper,
+            bucket=bucket,
+            config=config,
+        )
+        stop_score = _full_grpo_stop_score(
+            ctx=ctx,
+            trajectory=traj,
+            final_mask=final_mask,
+            grow_ratio=grow_ratio,
+            lower=lower,
+            upper=upper,
+        )
+        _, _, compactness = _compute_shape_frontier_features(ctx=ctx, membership_mask=final_mask)
+
+        scores[i] = (
+            float(config.full_grpo_reward_weight) * mean_step_reward
+            + float(config.full_grpo_size_weight) * size_score
+            + float(config.full_grpo_stop_weight) * stop_score
+            + float(config.full_grpo_compact_weight) * compactness
+        )
+    return scores
+
+
+def _compute_full_grpo_episode_advantages(
+    trajectories: list["EpisodeTrajectory"],
+    episode_contexts: list[EpisodeContext],
+    *,
+    group_size: int,
+    norm_epsilon: float,
+    config: PPOTrainingConfig,
+) -> np.ndarray:
+    """Standardize full-GRPO terminal scores within each same-cell group."""
+    scores = _compute_full_grpo_episode_scores(trajectories, episode_contexts, config)
+    if len(scores) % int(group_size) != 0:
+        raise ValueError("trajectory count must be divisible by group_size")
+    advantages = np.zeros_like(scores, dtype=np.float64)
+    for start in range(0, len(scores), int(group_size)):
+        stop = start + int(group_size)
+        group = scores[start:stop]
+        advantages[start:stop] = (group - float(np.mean(group))) / (float(np.std(group, ddof=0)) + norm_epsilon)
+    return advantages
+
+
+def _final_membership_mask_from_trajectory(
+    *,
+    ctx: EpisodeContext,
+    trajectory: EpisodeTrajectory,
+) -> np.ndarray:
+    mask = np.asarray(ctx.initial_membership_mask, dtype=np.uint8).copy()
+    for step in trajectory.steps:
+        if int(step.action) > 0:
+            mask[int(step.action) - 1] = 1
+    return mask
+
+
+def _full_grpo_size_target_interval(seed_count: int, config: PPOTrainingConfig) -> tuple[float, float, str]:
+    if int(seed_count) <= int(config.full_grpo_small_seed_max):
+        return float(config.full_grpo_small_target_min), float(config.full_grpo_small_target_max), "small"
+    if int(seed_count) >= int(config.full_grpo_large_seed_min):
+        return float(config.full_grpo_large_target_min), float(config.full_grpo_large_target_max), "large"
+    return float(config.full_grpo_medium_target_min), float(config.full_grpo_medium_target_max), "medium"
+
+
+def _full_grpo_size_score(
+    *,
+    grow_ratio: float,
+    lower: float,
+    upper: float,
+    bucket: str,
+    config: PPOTrainingConfig,
+) -> float:
+    under = max(0.0, float(lower) - float(grow_ratio)) / max(float(lower), 1.0e-8)
+    over = max(0.0, float(grow_ratio) - float(upper)) / max(float(upper), 1.0e-8)
+    under_weight = float(config.full_grpo_large_under_weight) if bucket == "large" else 1.0
+    over_weight = float(config.full_grpo_small_over_weight) if bucket == "small" else 1.0
+    return -float(under_weight * under * under + over_weight * over * over)
+
+
+def _full_grpo_stop_score(
+    *,
+    ctx: EpisodeContext,
+    trajectory: EpisodeTrajectory,
+    final_mask: np.ndarray,
+    grow_ratio: float,
+    lower: float,
+    upper: float,
+) -> float:
+    if not trajectory.steps:
+        return 0.0
+
+    final_action = int(trajectory.steps[-1].action)
+    stopped = final_action == 0
+    frontier = compute_frontier_eligible_mask(final_mask, ctx.neighbor_index)
+    frontier_delta = 0.0
+    if np.any(frontier):
+        posterior = _posterior_from_membership_mask(ctx=ctx, membership_mask=final_mask)
+        neighbor_support = compute_neighbor_support_fraction(final_mask, ctx.neighbor_index)
+        add_rewards = _add_rewards_from_membership_mask(
+            ctx=ctx,
+            membership_mask=final_mask,
+            posterior=posterior,
+            neighbor_support=neighbor_support,
+            frontier_mask=frontier,
+        )
+        frontier_delta = max(
+            0.0,
+            float(
+                compute_stop_delta(
+                    add_rewards,
+                    frontier,
+                    stop_stat=ctx.stop_stat,
+                    stop_top_k=ctx.stop_top_k,
+                )
+            ),
+        )
+
+    score = 0.0
+    if stopped and float(grow_ratio) < float(lower):
+        score -= frontier_delta
+    if not stopped and float(grow_ratio) > float(upper):
+        score -= (float(grow_ratio) - float(upper)) / max(float(upper), 1.0e-8)
+    return score
+
+
 def ppo_update(
     model: ActorCritic,
     optimizer: torch.optim.Optimizer,
@@ -1047,6 +1222,7 @@ def ppo_update(
     ent_coef: float,
     max_grad_norm: float,
     target_kl: float | None,
+    include_value_loss: bool,
     device: torch.device,
     rng: np.random.Generator,
 ) -> PPOUpdateMetrics:
@@ -1087,8 +1263,12 @@ def ppo_update(
             surr1 = ratio * batch["advantages"]
             surr2 = torch.clamp(ratio, 1.0 - eps_clip, 1.0 + eps_clip) * batch["advantages"]
             policy_loss = -torch.min(surr1, surr2).mean()
-            value_loss = torch.mean((values - batch["returns"]) ** 2)
-            total_loss = policy_loss + vf_coef * value_loss - ent_coef * entropy
+            if include_value_loss:
+                value_loss = torch.mean((values - batch["returns"]) ** 2)
+                total_loss = policy_loss + vf_coef * value_loss - ent_coef * entropy
+            else:
+                value_loss = values.new_tensor(0.0)
+                total_loss = policy_loss - ent_coef * entropy
 
             optimizer.zero_grad(set_to_none=True)
             total_loss.backward()
@@ -1132,7 +1312,7 @@ def train_one_update(
     t0 = time.perf_counter()
     sampled_cells = (
         int(config.batch_cells) // int(config.group_relative_group_size)
-        if bool(config.group_relative_enabled)
+        if bool(config.group_relative_enabled) or str(config.training_mode) == "full_grpo"
         else int(config.batch_cells)
     )
     contexts = _collect_episode_contexts(
@@ -1140,7 +1320,7 @@ def train_one_update(
         batch_cells=sampled_cells,
         max_steps_per_episode=config.max_steps_per_episode,
     )
-    if bool(config.group_relative_enabled):
+    if bool(config.group_relative_enabled) or str(config.training_mode) == "full_grpo":
         contexts = _expand_group_relative_contexts(
             contexts=contexts,
             group_size=int(config.group_relative_group_size),
@@ -1174,6 +1354,9 @@ def train_one_update(
         group_relative_mix_alpha=float(config.group_relative_mix_alpha),
         group_relative_norm_epsilon=float(config.group_relative_norm_epsilon),
         group_relative_score=str(config.group_relative_score),
+        training_mode=str(config.training_mode),
+        episode_contexts=contexts,
+        config=config,
     )
     t_buffer = time.perf_counter() - t0
 
@@ -1196,12 +1379,16 @@ def train_one_update(
         ent_coef=float(config.ent_coef),
         max_grad_norm=float(config.max_grad_norm),
         target_kl=config.target_kl,
+        include_value_loss=str(config.training_mode) != "full_grpo",
         device=device,
         rng=rng,
     )
     t_ppo = time.perf_counter() - t0
 
-    avg_batch_reward = float(np.mean([t.total_reward for t in trajectories]))
+    if str(config.training_mode) == "full_grpo":
+        avg_batch_reward = float(np.mean(_compute_full_grpo_episode_scores(trajectories, contexts, config)))
+    else:
+        avg_batch_reward = float(np.mean([t.total_reward for t in trajectories]))
     timing = {
         "time_context_sec": float(t_context),
         "time_rollout_sec": float(t_rollout),
@@ -1502,6 +1689,7 @@ def run_ppo_training(config: PPOTrainingConfig) -> PPOTrainingResult:
             "seed": config.seed,
             "device": str(device),
             "n_cells_total": int(dataset.n_cells),
+            "training_mode": str(config.training_mode),
             "rollout_mode": str(config.rollout_mode),
             "n_rollout_workers": int(config.n_rollout_workers),
             "gae_lambda": float(config.gae_lambda),
@@ -1585,6 +1773,7 @@ def run_ppo_training(config: PPOTrainingConfig) -> PPOTrainingResult:
                     "n_transitions": row.n_transitions,
                     "best_moving_avg_reward": best_moving_avg,
                     "checkpoint_saved": bool(improved),
+                    "training_mode": str(config.training_mode),
                     "gae_lambda": float(config.gae_lambda),
                     "group_relative_enabled": bool(config.group_relative_enabled),
                     "group_relative_group_size": int(config.group_relative_group_size),
@@ -1711,6 +1900,9 @@ def load_ppo_training_config(config_path: str | Path) -> PPOTrainingConfig:
     max_steps_per_episode = None if max_steps_raw is None else int(max_steps_raw)
     if max_steps_per_episode is not None and max_steps_per_episode <= 0:
         raise ConfigError("run.max_steps_per_episode must be > 0 when provided")
+    training_mode = str(run.get("training_mode", "ppo")).strip().lower()
+    if training_mode not in {"ppo", "full_grpo"}:
+        raise ConfigError("run.training_mode must be one of: ppo, full_grpo")
 
     episodes_index_path = Path(str(_require(inputs, "episodes_index_path", "inputs"))).expanduser().resolve()
     reference_cfg = _as_dict(_require(inputs, "reference", "inputs"), "inputs.reference")
@@ -1783,8 +1975,38 @@ def load_ppo_training_config(config_path: str | Path) -> PPOTrainingConfig:
     group_relative_score = str(group_relative.get("score", "episode_total_reward")).strip().lower()
     if group_relative_score != "episode_total_reward":
         raise ConfigError("group_relative.score must be 'episode_total_reward'")
-    if group_relative_enabled and batch_cells % group_relative_group_size != 0:
+    if (group_relative_enabled or training_mode == "full_grpo") and batch_cells % group_relative_group_size != 0:
         raise ConfigError("run.batch_cells must be divisible by group_relative.group_size when enabled")
+    if training_mode == "full_grpo" and not group_relative_enabled:
+        raise ConfigError("group_relative.enabled must be true when run.training_mode is full_grpo")
+
+    full_grpo = _as_dict(raw.get("full_grpo", {}), "full_grpo")
+    full_grpo_reward_weight = float(full_grpo.get("reward_weight", 1.0))
+    full_grpo_size_weight = float(full_grpo.get("size_weight", 0.8))
+    full_grpo_stop_weight = float(full_grpo.get("stop_weight", 0.4))
+    full_grpo_compact_weight = float(full_grpo.get("compact_weight", 0.2))
+    full_grpo_small_over_weight = float(full_grpo.get("small_over_weight", 1.2))
+    full_grpo_large_under_weight = float(full_grpo.get("large_under_weight", 1.2))
+    full_grpo_small_seed_max = int(full_grpo.get("small_seed_max", 8))
+    full_grpo_large_seed_min = int(full_grpo.get("large_seed_min", 17))
+    if full_grpo_small_seed_max <= 0:
+        raise ConfigError("full_grpo.small_seed_max must be > 0")
+    if full_grpo_large_seed_min <= full_grpo_small_seed_max:
+        raise ConfigError("full_grpo.large_seed_min must be > full_grpo.small_seed_max")
+    for name, val in (
+        ("reward_weight", full_grpo_reward_weight),
+        ("size_weight", full_grpo_size_weight),
+        ("stop_weight", full_grpo_stop_weight),
+        ("compact_weight", full_grpo_compact_weight),
+        ("small_over_weight", full_grpo_small_over_weight),
+        ("large_under_weight", full_grpo_large_under_weight),
+    ):
+        if val < 0:
+            raise ConfigError(f"full_grpo.{name} must be >= 0")
+    targets = _as_dict(full_grpo.get("targets", {}), "full_grpo.targets")
+    small_target = _parse_grpo_target_interval(targets.get("small", [1.4, 2.4]), "full_grpo.targets.small")
+    medium_target = _parse_grpo_target_interval(targets.get("medium", [1.6, 2.8]), "full_grpo.targets.medium")
+    large_target = _parse_grpo_target_interval(targets.get("large", [1.8, 3.4]), "full_grpo.targets.large")
 
     epsilon = float(reward.get("epsilon", 1e-8))
     if epsilon < 0:
@@ -1836,6 +2058,7 @@ def load_ppo_training_config(config_path: str | Path) -> PPOTrainingConfig:
         n_rollout_workers=n_rollout_workers,
         max_updates=max_updates,
         max_steps_per_episode=max_steps_per_episode,
+        training_mode=training_mode,
         episodes_index_path=episodes_index_path,
         reference_path=reference_path,
         reference_format=reference_format,
@@ -1864,6 +2087,20 @@ def load_ppo_training_config(config_path: str | Path) -> PPOTrainingConfig:
         group_relative_mix_alpha=group_relative_mix_alpha,
         group_relative_norm_epsilon=group_relative_norm_epsilon,
         group_relative_score=group_relative_score,
+        full_grpo_reward_weight=full_grpo_reward_weight,
+        full_grpo_size_weight=full_grpo_size_weight,
+        full_grpo_stop_weight=full_grpo_stop_weight,
+        full_grpo_compact_weight=full_grpo_compact_weight,
+        full_grpo_small_over_weight=full_grpo_small_over_weight,
+        full_grpo_large_under_weight=full_grpo_large_under_weight,
+        full_grpo_small_seed_max=full_grpo_small_seed_max,
+        full_grpo_large_seed_min=full_grpo_large_seed_min,
+        full_grpo_small_target_min=small_target[0],
+        full_grpo_small_target_max=small_target[1],
+        full_grpo_medium_target_min=medium_target[0],
+        full_grpo_medium_target_max=medium_target[1],
+        full_grpo_large_target_min=large_target[0],
+        full_grpo_large_target_max=large_target[1],
         epsilon=epsilon,
         r_max_um=r_max_um,
         w1=w1,
@@ -1894,36 +2131,55 @@ def _build_rollout_buffer(
     group_relative_mix_alpha: float,
     group_relative_norm_epsilon: float,
     group_relative_score: str,
+    training_mode: str = "ppo",
+    episode_contexts: list[EpisodeContext] | None = None,
+    config: PPOTrainingConfig | None = None,
 ) -> list[RolloutTransition]:
     out: list[RolloutTransition] = []
-    group_relative_bonus = (
-        _compute_group_relative_episode_advantages(
+    mode = str(training_mode).strip().lower()
+    if mode == "full_grpo":
+        if episode_contexts is None or config is None:
+            raise ValueError("full_grpo rollout buffer requires episode_contexts and config")
+        group_relative_bonus = _compute_full_grpo_episode_advantages(
             trajectories,
+            episode_contexts,
             group_size=int(group_relative_group_size),
             norm_epsilon=float(group_relative_norm_epsilon),
-            score=str(group_relative_score),
+            config=config,
         )
-        if group_relative_enabled and trajectories
-        else None
-    )
+    else:
+        group_relative_bonus = (
+            _compute_group_relative_episode_advantages(
+                trajectories,
+                group_size=int(group_relative_group_size),
+                norm_epsilon=float(group_relative_norm_epsilon),
+                score=str(group_relative_score),
+            )
+            if group_relative_enabled and trajectories
+            else None
+        )
     for traj_idx, traj in enumerate(trajectories):
         rewards = np.asarray([s.reward for s in traj.steps], dtype=np.float64)
         values = np.asarray([s.old_value for s in traj.steps], dtype=np.float64)
         dones = np.asarray([s.done for s in traj.steps], dtype=bool)
-        returns, advantages = compute_gae_returns_and_advantages(
-            rewards,
-            values,
-            dones,
-            gamma=gamma,
-            gae_lambda=gae_lambda,
-        )
-        if normalize_returns_per_episode and returns.size > 1:
-            returns = _zscore_1d(returns)
-        if group_relative_bonus is not None:
-            advantages = (
-                (1.0 - float(group_relative_mix_alpha)) * advantages
-                + float(group_relative_mix_alpha) * float(group_relative_bonus[traj_idx])
+        if mode == "full_grpo":
+            returns = np.zeros_like(rewards, dtype=np.float64)
+            advantages = np.full_like(rewards, fill_value=float(group_relative_bonus[traj_idx]), dtype=np.float64)
+        else:
+            returns, advantages = compute_gae_returns_and_advantages(
+                rewards,
+                values,
+                dones,
+                gamma=gamma,
+                gae_lambda=gae_lambda,
             )
+            if normalize_returns_per_episode and returns.size > 1:
+                returns = _zscore_1d(returns)
+            if group_relative_bonus is not None:
+                advantages = (
+                    (1.0 - float(group_relative_mix_alpha)) * advantages
+                    + float(group_relative_mix_alpha) * float(group_relative_bonus[traj_idx])
+                )
         for i, step in enumerate(traj.steps):
             out.append(
                 RolloutTransition(
@@ -2690,6 +2946,16 @@ def _require(mapping: dict[str, Any], key: str, section: str) -> Any:
     if key not in mapping:
         raise ConfigError(f"missing required key {key!r} in {section}")
     return mapping[key]
+
+
+def _parse_grpo_target_interval(value: Any, section: str) -> tuple[float, float]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ConfigError(f"{section} must be a two-value [min, max] list")
+    lo = float(value[0])
+    hi = float(value[1])
+    if lo <= 0 or hi <= lo:
+        raise ConfigError(f"{section} must satisfy 0 < min < max")
+    return lo, hi
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
