@@ -39,7 +39,7 @@ ppo:
   vf_coef: 0.0
   ent_coef: 0.008
   max_grad_norm: 1.0
-  hidden_dim: 256
+  hidden_dim: 128
   target_kl: 0.01
 
 group_relative:
@@ -70,6 +70,7 @@ reward:
   w2: 1.0
   w3: 1.0
   w4: 0.05
+  w5: 0.10   # old bin-posterior compatibility helper
   stop_lambda: 0.7
   stop_stat: topk_mean
   stop_top_k: 5

@@ -440,6 +440,10 @@ def main():
                        help='Optional GT all-bin CSV/CSV.GZ for PPO-format evaluation.')
     parser.add_argument('--gt_nuclear_bins_path', type=str, default=None,
                        help='Optional GT nuclear-bin CSV/CSV.GZ for PPO-format evaluation.')
+    parser.add_argument('--gt_cell_assignments_csv', type=str, default=None,
+                       help='Optional pseudo-data cell_id to sc_cell_barcode mapping for gene correlation.')
+    parser.add_argument('--gt_sc_expression_h5', type=str, default=None,
+                       help='Optional ground-truth single-cell expression H5 for gene correlation.')
     parser.add_argument('--gt_min_nuclear_overlap_frac', type=float, default=0.3,
                        help='Minimum nuclear overlap fraction required when matching GT cells.')
     parser.add_argument('--gt_min_nuclear_overlap_bins', type=int, default=2,

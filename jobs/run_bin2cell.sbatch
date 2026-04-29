@@ -37,7 +37,7 @@ MAX_BIN_DISTANCE="${MAX_BIN_DISTANCE:-5}"
 GAUSSIAN_SIGMA="${GAUSSIAN_SIGMA:-5.0}"
 EXTERNAL_NUCLEAR_BINS_PATH="${EXTERNAL_NUCLEAR_BINS_PATH:-workspace_outputs/pseudo_human_colorectal/intermediate/cropped_visium_hd_human_colorectal_pseudo_square_002um_nuclear_bins.csv.gz}"
 
-PPO_EVAL_RUN_DIR="${PPO_EVAL_RUN_DIR:-runs/human_colorectal_ppo_eval_20260421T181912Z}"
+PPO_EVAL_RUN_DIR="${PPO_EVAL_RUN_DIR:-runs/human_colorectal_ppo_eval_20260424T204220Z}"
 EVAL_RUN_NAME="${EVAL_RUN_NAME:-human_colorectal_bin2cell_eval}"
 EVAL_OUTPUT_ROOT="${EVAL_OUTPUT_ROOT:-runs}"
 OVERLAY_MAX_CELLS="${OVERLAY_MAX_CELLS:-300}"
@@ -47,6 +47,8 @@ PRED_MIN_NUCLEAR_OVERLAP_FRAC="${PRED_MIN_NUCLEAR_OVERLAP_FRAC:-0.3}"
 PRED_MIN_NUCLEAR_OVERLAP_BINS="${PRED_MIN_NUCLEAR_OVERLAP_BINS:-2}"
 GT_CELL_BINS_PATH="${GT_CELL_BINS_PATH:-workspace_outputs/pseudo_human_colorectal/intermediate/cropped_visium_hd_human_colorectal_pseudo_square_002um_cell_bins.csv.gz}"
 GT_NUCLEAR_BINS_PATH="${GT_NUCLEAR_BINS_PATH:-workspace_outputs/pseudo_human_colorectal/intermediate/cropped_visium_hd_human_colorectal_pseudo_square_002um_nuclear_bins.csv.gz}"
+GT_CELL_ASSIGNMENTS_CSV="${GT_CELL_ASSIGNMENTS_CSV:-colorectal_pseudo_visium_hd_output_full_0.25/ground_truth_cell_assignments.csv}"
+GT_SC_EXPRESSION_H5="${GT_SC_EXPRESSION_H5:-colorectal_sc_data/CRC_GSE166555_raw_tumor.h5}"
 GT_MIN_NUCLEAR_OVERLAP_FRAC="${GT_MIN_NUCLEAR_OVERLAP_FRAC:-0.3}"
 GT_MIN_NUCLEAR_OVERLAP_BINS="${GT_MIN_NUCLEAR_OVERLAP_BINS:-2}"
 
@@ -71,6 +73,8 @@ echo "PRED_MIN_NUCLEAR_OVERLAP_FRAC: $PRED_MIN_NUCLEAR_OVERLAP_FRAC"
 echo "PRED_MIN_NUCLEAR_OVERLAP_BINS: $PRED_MIN_NUCLEAR_OVERLAP_BINS"
 echo "GT_CELL_BINS_PATH: $GT_CELL_BINS_PATH"
 echo "GT_NUCLEAR_BINS_PATH: $GT_NUCLEAR_BINS_PATH"
+echo "GT_CELL_ASSIGNMENTS_CSV: $GT_CELL_ASSIGNMENTS_CSV"
+echo "GT_SC_EXPRESSION_H5: $GT_SC_EXPRESSION_H5"
 echo "GT_MIN_NUCLEAR_OVERLAP_FRAC: $GT_MIN_NUCLEAR_OVERLAP_FRAC"
 echo "GT_MIN_NUCLEAR_OVERLAP_BINS: $GT_MIN_NUCLEAR_OVERLAP_BINS"
 
@@ -96,6 +100,8 @@ python preprocessing/run_bin2cell_analysis.py \
   --pred_min_nuclear_overlap_bins "$PRED_MIN_NUCLEAR_OVERLAP_BINS" \
   --gt_cell_bins_path "$GT_CELL_BINS_PATH" \
   --gt_nuclear_bins_path "$GT_NUCLEAR_BINS_PATH" \
+  --gt_cell_assignments_csv "$GT_CELL_ASSIGNMENTS_CSV" \
+  --gt_sc_expression_h5 "$GT_SC_EXPRESSION_H5" \
   --gt_min_nuclear_overlap_frac "$GT_MIN_NUCLEAR_OVERLAP_FRAC" \
   --gt_min_nuclear_overlap_bins "$GT_MIN_NUCLEAR_OVERLAP_BINS"
 

@@ -134,6 +134,7 @@ class RewardGridSearchConfig:
     normalize_expression_zscore: bool
     zscore_delta: float
     w4: float
+    w5: float
     w1_axis: GridAxis
     w2_axis: GridAxis
     w3_axis: GridAxis
@@ -179,6 +180,7 @@ class RewardGridSearchConfig:
                 "normalize_expression_zscore": self.normalize_expression_zscore,
                 "zscore_delta": self.zscore_delta,
                 "w4": self.w4,
+                "w5": self.w5,
                 "stop_stat": self.stop_stat,
                 "stop_top_k": self.stop_top_k,
             },
@@ -277,6 +279,7 @@ class RewardGridSearchResult:
     w2: float
     w3: float
     w4: float
+    w5: float
     stop_lambda: float
     n_episodes: int
     mean_return: float
@@ -310,6 +313,7 @@ class RewardGridSearchResult:
             "w2": self.w2,
             "w3": self.w3,
             "w4": self.w4,
+            "w5": self.w5,
             "stop_lambda": self.stop_lambda,
             "n_episodes": self.n_episodes,
             "mean_return": self.mean_return,
@@ -586,6 +590,9 @@ def load_reward_grid_search_config(config_path: str | Path) -> RewardGridSearchC
     w4 = float(reward_cfg.get("w4", 0.0))
     if w4 < 0:
         raise ConfigError("reward.w4 must be >= 0")
+    w5 = float(reward_cfg.get("w5", 0.0))
+    if w5 < 0:
+        raise ConfigError("reward.w5 must be >= 0")
     stop_stat = str(reward_cfg.get("stop_stat", "max")).strip().lower()
     if stop_stat not in {"max", "topk_mean"}:
         raise ConfigError("reward.stop_stat must be 'max' or 'topk_mean'")
@@ -684,6 +691,7 @@ def load_reward_grid_search_config(config_path: str | Path) -> RewardGridSearchC
         normalize_expression_zscore=normalize_expression_zscore,
         zscore_delta=zscore_delta,
         w4=w4,
+        w5=w5,
         w1_axis=w1_axis,
         w2_axis=w2_axis,
         w3_axis=w3_axis,
@@ -851,6 +859,7 @@ def run_reward_grid_search(
             "epsilon": float(config.epsilon),
             "r_max_um": float(config.r_max_um),
             "expression_confidence_pseudocount": float(config.expression_confidence_pseudocount),
+            "w5": float(config.w5),
             "stop_stat": str(config.stop_stat),
             "stop_top_k": int(config.stop_top_k),
             "normalize_expression_zscore": bool(config.normalize_expression_zscore),
@@ -895,6 +904,7 @@ def run_reward_grid_search(
                 w2=w2,
                 w3=w3,
                 w4=w4,
+                w5=config.w5,
                 stop_lambda=stop_lambda,
                 stop_stat=config.stop_stat,
                 stop_top_k=config.stop_top_k,
@@ -1011,6 +1021,7 @@ def _evaluate_weight_combination(
     w2: float,
     w3: float,
     w4: float,
+    w5: float,
     stop_lambda: float,
     stop_stat: str,
     stop_top_k: int,
@@ -1043,6 +1054,7 @@ def _evaluate_weight_combination(
             w2=w2,
             w3=w3,
             w4=w4,
+            w5=w5,
             stop_lambda=stop_lambda,
             stop_stat=stop_stat,
             stop_top_k=stop_top_k,
@@ -1106,6 +1118,7 @@ def _evaluate_weight_combination(
         w2=float(w2),
         w3=float(w3),
         w4=float(w4),
+        w5=float(w5),
         stop_lambda=float(stop_lambda),
         n_episodes=len(totals),
         mean_return=float(total_return.mean()),
@@ -1143,6 +1156,7 @@ def _evaluate_weight_combination_worker(
         w2=float(w2),
         w3=float(w3),
         w4=float(w4),
+        w5=float(ctx["w5"]),
         stop_lambda=float(stop_lambda),
         stop_stat=str(ctx["stop_stat"]),
         stop_top_k=int(ctx["stop_top_k"]),

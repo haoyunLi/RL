@@ -16,6 +16,8 @@ cellpose/
 Bin2Cell_Validation/
 bin2cell_env/
 smurf/
+stcs_env/
+external/STCS/
 
 # Scheduler and log outputs
 *.out
@@ -26,3 +28,4 @@ smurf/
 Human_Colorectal/
 colorectal_sc_data/
 colorectal_pseudo_visium_hd_output_full_0.25/
+figures/

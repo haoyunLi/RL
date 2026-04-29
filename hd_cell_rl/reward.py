@@ -309,7 +309,9 @@ class PosteriorAddBinReward:
     - conf[b] = c[b] / (c[b] + a), where c[b] is selected-gene total count in bin b
     - p(k|ST) from softmax(log p(ST|k) + uniform prior)
     - neighbor_support[b] = touched_8_neighbors[b] / 8
-    - R_add[b] = w1 * (conf[b] * R_expr[b]) - w2 * P_dis[b] - w3 * P_overlap[b] + w4 * neighbor_support[b]
+    - R_expr_new[b] = conf[b] * (max_k p(k|ST+b) - max_k p(k|ST))
+    - R_expr_old[b] = conf[b] * sum_k p(k|ST) * LL[b,k]
+    - R_add[b] = w1 * R_expr_new[b] + w5 * R_expr_old[b] - w2 * P_dis[b] - w3 * P_overlap[b] + w4 * neighbor_support[b]
     - R_stop = -lambda * stop_delta over currently add-eligible bins
       where stop_delta is either max frontier add reward or mean(top-k frontier add rewards)
     """
@@ -329,6 +331,7 @@ class PosteriorAddBinReward:
         w2: float = 1.0,
         w3: float = 1.0,
         w4: float = 0.0,
+        w5: float = 0.0,
         stop_lambda: float = 1.0,
         stop_stat: str = "max",
         stop_top_k: int = 3,
@@ -364,6 +367,8 @@ class PosteriorAddBinReward:
             raise ValueError("zscore_delta must be > 0")
         if expression_confidence_pseudocount < 0:
             raise ValueError("expression_confidence_pseudocount must be >= 0")
+        if w5 < 0:
+            raise ValueError("w5 must be >= 0")
 
         self._candidate_bin_ids = tuple(str(x) for x in candidate_bin_ids)
         self._bin_id_to_index = {bin_id: i for i, bin_id in enumerate(self._candidate_bin_ids)}
@@ -474,6 +479,7 @@ class PosteriorAddBinReward:
         self._w2 = float(w2)
         self._w3 = float(w3)
         self._w4 = float(w4)
+        self._w5 = float(w5)
         self._stop_lambda = float(stop_lambda)
         self._stop_stat = str(stop_stat).strip().lower()
         if self._stop_stat not in {"max", "topk_mean"}:
@@ -516,45 +522,33 @@ class PosteriorAddBinReward:
         return _softmax_stable(s)
 
     def expression_reward_per_bin(self, membership_mask: np.ndarray) -> np.ndarray:
-        """Compute R_expr[b] = sum_k p(k|ST) * LL[b,k] for all bins."""
-        posterior = self.posterior_given_state(membership_mask)
-        return np.sum(self._ll * posterior[None, :], axis=1) * self._expression_confidence
+        """Compute posterior-confidence gain from adding each candidate bin."""
+        mask = self._validate_membership_mask(membership_mask)
+        return self._posterior_confidence_delta_per_bin(mask)
 
     def add_reward_for_bin(self, membership_mask: np.ndarray, bin_id: str) -> float:
         """Compute R_add for one bin only.
 
-        This helper avoids full-vector recomputation for ADD_BIN when expression
-        z-score normalization is disabled.
+        This helper uses the same posterior-confidence gain score as the
+        full-vector path, then returns the selected bin's scalar reward.
         """
         mask = self._validate_membership_mask(membership_mask)
         if bin_id not in self._bin_id_to_index:
             raise KeyError(f"unknown bin_id for reward: {bin_id!r}")
 
         idx = self._bin_id_to_index[bin_id]
-        posterior = self.posterior_given_state(mask)
-        return self._add_reward_for_index(mask, idx, posterior)
+        return self._add_reward_for_index(mask, idx)
 
     def add_reward_per_bin(self, membership_mask: np.ndarray) -> np.ndarray:
         """Compute R_add[b] for all candidate bins given current state ST."""
         mask = self._validate_membership_mask(membership_mask)
         eligible = self.frontier_add_mask(mask)
-
-        posterior = self.posterior_given_state(mask)
-        r_expr = np.sum(self._ll * posterior[None, :], axis=1) * self._expression_confidence
-
-        if self._normalize_expression_zscore:
-            if np.any(eligible):
-                mu = float(np.mean(r_expr[eligible]))
-                sigma = float(np.std(r_expr[eligible], ddof=0))
-                expr_term = (r_expr - mu) / (sigma + self._zscore_delta)
-            else:
-                expr_term = np.zeros_like(r_expr)
-        else:
-            expr_term = r_expr
+        _, expr_new_term, _, expr_old_term = self._expression_reward_terms_per_bin(mask, eligible)
 
         neighbor_support = compute_neighbor_support_fraction(mask, self._neighbor_index)
         r_add = (
-            self._w1 * expr_term
+            self._w1 * expr_new_term
+            + self._w5 * expr_old_term
             - self._w2 * self._p_dis
             - self._w3 * self._p_overlap
             + self._w4 * neighbor_support
@@ -619,8 +613,7 @@ class PosteriorAddBinReward:
                 raise KeyError(f"unknown bin_id for reward: {action.bin_id!r}")
 
             idx = self._bin_id_to_index[action.bin_id]
-            posterior = self.posterior_given_state(prev_mask)
-            return self._add_reward_for_index(prev_mask, idx, posterior)
+            return self._add_reward_for_index(prev_mask, idx)
 
         if action.kind == ActionType.STOP:
             return float(self.stop_reward(prev_mask))
@@ -655,36 +648,73 @@ class PosteriorAddBinReward:
         self,
         membership_mask: np.ndarray,
         bin_index: int,
-        posterior: np.ndarray,
     ) -> float:
         """Internal single-bin reward computation.
 
-        Fast path:
-        - If z-score normalization is disabled, computes in O(K) time.
-        Fallback:
-        - If z-score normalization is enabled, computes required eligible-bin
-          statistics first.
+        Uses the same vector path as ``add_reward_per_bin`` so frontier z-scoring
+        and the w1/w5 expression mixture stay identical.
         """
-        expr = float(np.sum(self._ll[bin_index] * posterior) * self._expression_confidence[bin_index])
-
-        if self._normalize_expression_zscore:
-            r_expr = np.sum(self._ll * posterior[None, :], axis=1) * self._expression_confidence
-            eligible = self.frontier_add_mask(membership_mask)
-            if np.any(eligible):
-                mu = float(np.mean(r_expr[eligible]))
-                sigma = float(np.std(r_expr[eligible], ddof=0))
-                expr_term = (expr - mu) / (sigma + self._zscore_delta)
-            else:
-                expr_term = 0.0
-        else:
-            expr_term = expr
+        eligible = self.frontier_add_mask(membership_mask)
+        _, expr_new_term, _, expr_old_term = self._expression_reward_terms_per_bin(membership_mask, eligible)
 
         return float(
-            self._w1 * expr_term
+            self._w1 * float(expr_new_term[bin_index])
+            + self._w5 * float(expr_old_term[bin_index])
             - self._w2 * self._p_dis[bin_index]
             - self._w3 * self._p_overlap[bin_index]
             + self._w4 * self._neighbor_fraction_for_index(membership_mask, bin_index)
         )
+
+    def _posterior_confidence_delta_per_bin(self, membership_mask: np.ndarray) -> np.ndarray:
+        """Return conf[b] * (max posterior after adding b - current max posterior)."""
+        mask = self._validate_membership_mask(membership_mask).astype(bool, copy=False)
+        if self.n_candidate_bins == 0:
+            return np.zeros((0,), dtype=np.float64)
+        if np.any(mask):
+            current_scores = np.sum(self._ll[mask], axis=0, dtype=np.float64) + self._log_prior
+        else:
+            current_scores = np.full((self.n_cell_types,), self._log_prior, dtype=np.float64)
+
+        current_posterior = _softmax_stable(current_scores)
+        current_confidence = float(np.max(current_posterior)) if current_posterior.size > 0 else 0.0
+        next_scores = current_scores[None, :] + self._ll
+        next_scores = next_scores - np.max(next_scores, axis=1, keepdims=True)
+        next_exp = np.exp(next_scores)
+        next_posterior = next_exp / np.maximum(np.sum(next_exp, axis=1, keepdims=True), 1.0e-300)
+        next_confidence = np.max(next_posterior, axis=1)
+        return (next_confidence - current_confidence) * self._expression_confidence
+
+    def _old_bin_compatibility_per_bin(self, membership_mask: np.ndarray) -> np.ndarray:
+        """Return old conf[b] * sum_k p(k|ST) * LL[b,k] compatibility score."""
+        posterior = self.posterior_given_state(membership_mask)
+        return (self._ll @ posterior) * self._expression_confidence
+
+    def _zscore_over_frontier(self, values: np.ndarray, frontier_mask: np.ndarray) -> np.ndarray:
+        values_arr = np.asarray(values, dtype=np.float64)
+        frontier = np.asarray(frontier_mask, dtype=bool)
+        if values_arr.shape != frontier.shape:
+            raise ValueError("values and frontier_mask must have the same shape")
+        if not np.any(frontier):
+            return np.zeros_like(values_arr)
+        frontier_values = values_arr[frontier]
+        return (values_arr - float(np.mean(frontier_values))) / (
+            float(np.std(frontier_values, ddof=0)) + self._zscore_delta
+        )
+
+    def _expression_reward_terms_per_bin(
+        self,
+        membership_mask: np.ndarray,
+        frontier_mask: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        expr_new_raw = self._posterior_confidence_delta_per_bin(membership_mask)
+        expr_old_raw = self._old_bin_compatibility_per_bin(membership_mask)
+        if self._normalize_expression_zscore:
+            expr_new_term = self._zscore_over_frontier(expr_new_raw, frontier_mask)
+            expr_old_term = self._zscore_over_frontier(expr_old_raw, frontier_mask)
+        else:
+            expr_new_term = expr_new_raw
+            expr_old_term = expr_old_raw
+        return expr_new_raw, expr_new_term, expr_old_raw, expr_old_term
 
     def _neighbor_fraction_for_index(self, membership_mask: np.ndarray, bin_index: int) -> float:
         """Return touched-8-neighbor fraction for one candidate bin."""

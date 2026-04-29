@@ -21,6 +21,7 @@ from hd_cell_rl.ppo_training import (
     _add_rewards_from_membership_mask,
     _compute_dynamic_add_action_features,
     _compute_state_summary_from_mask,
+    _expression_reward_terms_per_bin,
     _normalize_cell_id,
     _observation_to_tensors,
     _posterior_from_membership_mask,
@@ -52,6 +53,44 @@ GLOBAL_FEATURE_NAMES: tuple[str, ...] = (
     "positive_frontier_fraction",
     "centroid_drift_scaled",
     "compactness_proxy",
+    "frontier_add_reward_topk_mean",
+    "frontier_add_reward_mean",
+    "frontier_add_reward_std",
+    "frontier_add_reward_max",
+    "seed_compactness",
+    "seed_radius_p90_scaled",
+    "seed_aspect_ratio_scaled",
+)
+
+_ACTION_FEATURE_TAIL: tuple[str, ...] = (
+    "candidate_to_current_centroid_distance",
+    "candidate_compactness_gain",
+    "dx_from_nucleus_scaled",
+    "dy_from_nucleus_scaled",
+    "dx_from_current_centroid_scaled",
+    "dy_from_current_centroid_scaled",
+    "radial_alignment_with_centroid_drift",
+    "candidate_add_reward_total",
+    "candidate_expr_term",
+    "candidate_base_penalty",
+    "candidate_neighbor_support",
+    "candidate_expression_confidence",
+    "candidate_count_scaled",
+    "frontier_add_reward_topk_mean",
+    "frontier_add_reward_mean",
+    "frontier_add_reward_std",
+    "frontier_add_reward_max",
+    "seed_compactness",
+    "seed_radius_p90_scaled",
+    "seed_aspect_ratio_scaled",
+    "ll_margin_z",
+    "ll_entropy_scaled",
+    "candidate_seed_neighbor_support",
+    "candidate_dist_to_seed_centroid_scaled",
+    "candidate_expr_raw",
+    "candidate_expr_weighted",
+    "candidate_distance_penalty",
+    "candidate_overlap_penalty",
 )
 
 ACTION_FEATURE_NAMES: tuple[str, ...] = (
@@ -66,8 +105,7 @@ ACTION_FEATURE_NAMES: tuple[str, ...] = (
     "col8",
     "col9",
     "col10",
-    "candidate_to_current_centroid_distance",
-    "candidate_compactness_gain",
+    *_ACTION_FEATURE_TAIL,
 )
 
 STOP_ACTION_FEATURE_LABELS: tuple[str, ...] = (
@@ -82,8 +120,7 @@ STOP_ACTION_FEATURE_LABELS: tuple[str, ...] = (
     "positive_frontier_fraction",
     "centroid_drift_scaled",
     "compactness_proxy",
-    "candidate_to_current_centroid_distance",
-    "candidate_compactness_gain",
+    *_ACTION_FEATURE_TAIL,
 )
 
 ADD_ACTION_FEATURE_LABELS: tuple[str, ...] = (
@@ -98,8 +135,7 @@ ADD_ACTION_FEATURE_LABELS: tuple[str, ...] = (
     "positive_frontier_fraction_or_zero",
     "centroid_drift_scaled_or_zero",
     "compactness_proxy_or_zero",
-    "candidate_to_current_centroid_distance",
-    "candidate_compactness_gain",
+    *_ACTION_FEATURE_TAIL,
 )
 
 
@@ -727,25 +763,25 @@ class PPODebugSession:
             np.float32,
             copy=False,
         )
-        r_expr_raw = ((context.ll @ posterior) * context.expression_confidence).astype(np.float32, copy=False)
+        r_expr_raw, expr_term, expr_old_raw, expr_old_term = _expression_reward_terms_per_bin(
+            ctx=context,
+            membership_mask=membership_mask,
+            posterior=posterior,
+            frontier_mask=frontier_mask,
+        )
         if bool(context.normalize_expression_zscore) and np.any(frontier_mask):
             expr_frontier = r_expr_raw[frontier_mask]
             expr_frontier_mean = float(np.mean(expr_frontier))
             expr_frontier_std = float(np.std(expr_frontier, ddof=0))
-            expr_term = ((r_expr_raw - expr_frontier_mean) / (expr_frontier_std + float(context.zscore_delta))).astype(
-                np.float32,
-                copy=False,
-            )
         elif bool(context.normalize_expression_zscore):
             expr_frontier_mean = 0.0
             expr_frontier_std = 0.0
-            expr_term = np.zeros_like(r_expr_raw, dtype=np.float32)
         else:
             expr_frontier_mean = float(np.mean(r_expr_raw[frontier_mask])) if np.any(frontier_mask) else 0.0
             expr_frontier_std = float(np.std(r_expr_raw[frontier_mask], ddof=0)) if np.any(frontier_mask) else 0.0
-            expr_term = r_expr_raw
 
         expr_weighted = (float(context.w1) * expr_term).astype(np.float32, copy=False)
+        expr_old_weighted = (float(context.w5) * expr_old_term).astype(np.float32, copy=False)
         distance_penalty = (float(context.w2) * context.p_dis).astype(np.float32, copy=False)
         overlap_penalty = (float(context.w3) * context.p_overlap).astype(np.float32, copy=False)
         base_penalty = context.base_penalty.astype(np.float32, copy=False)
@@ -767,6 +803,10 @@ class PPODebugSession:
             membership_mask=membership_mask,
             step_index=step_index,
         )
+        if action_features.shape[1] > 30:
+            state_summary["seed_compactness"] = float(action_features[0, 28])
+            state_summary["seed_radius_p90_scaled"] = float(action_features[0, 29])
+            state_summary["seed_aspect_ratio_scaled"] = float(action_features[0, 30])
         stop_delta = float(
             compute_stop_delta(
                 add_rewards,
@@ -827,6 +867,9 @@ class PPODebugSession:
                 "expr_confidence": context.expression_confidence.astype(np.float32, copy=False),
                 "expr_term": expr_term.astype(np.float32, copy=False),
                 "expr_weighted": expr_weighted.astype(np.float32, copy=False),
+                "expr_old_raw": expr_old_raw.astype(np.float32, copy=False),
+                "expr_old_term": expr_old_term.astype(np.float32, copy=False),
+                "expr_old_weighted": expr_old_weighted.astype(np.float32, copy=False),
                 "distance_penalty": distance_penalty.astype(np.float32, copy=False),
                 "overlap_penalty": overlap_penalty.astype(np.float32, copy=False),
                 "base_penalty": base_penalty.astype(np.float32, copy=False),

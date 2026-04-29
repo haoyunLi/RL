@@ -33,6 +33,7 @@ reward:
   normalize_expression_zscore: true
   zscore_delta: 1.0e-8
   w4: 0.0
+  w5: 0.10
   stop_stat: topk_mean
   stop_top_k: 3
 

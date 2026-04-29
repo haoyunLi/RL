@@ -45,6 +45,10 @@ from hd_cell_rl.ppo_training import (
     _observation_to_tensors,
     load_ppo_training_config,
 )
+from preprocessing.ppo_format_assignment_eval import (
+    _add_numeric_summary,
+    annotate_records_with_gene_correlation,
+)
 
 _LOCAL_TIMEZONE = ZoneInfo("America/Chicago")
 _LOCAL_TIMEZONE_NAME = "America/Chicago"
@@ -126,6 +130,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Optional GT nuclear-bin table (.csv/.csv.gz) used to match each episode to a GT cell.",
+    )
+    parser.add_argument(
+        "--gt-cell-assignments-csv",
+        type=str,
+        default=None,
+        help="Optional pseudo-data cell_id -> sc_cell_barcode mapping for gene correlation.",
+    )
+    parser.add_argument(
+        "--gt-sc-expression-h5",
+        type=str,
+        default=None,
+        help="Optional ground-truth single-cell expression H5 for gene correlation.",
     )
     parser.add_argument(
         "--gt-min-nuclear-overlap-frac",
@@ -515,7 +531,7 @@ def _annotate_records_with_ground_truth(
                 for i, barcode in enumerate(rec.candidate_bin_ids)
                 if i < assigned_mask.shape[0] and assigned_mask[i]
             }
-            if pred_bars and gt_cell:
+            if gt_cell:
                 pred_intersection_bins = int(len(pred_bars & gt_cell))
                 union = int(len(pred_bars | gt_cell))
                 if union > 0:
@@ -523,8 +539,13 @@ def _annotate_records_with_ground_truth(
                 denom = int(len(pred_bars) + len(gt_cell))
                 if denom > 0:
                     pred_dice = float((2.0 * pred_intersection_bins) / denom)
-                pred_precision = float(pred_intersection_bins / len(pred_bars))
+                pred_precision = float(pred_intersection_bins / len(pred_bars)) if len(pred_bars) > 0 else 0.0
                 pred_recall = float(pred_intersection_bins / len(gt_cell))
+        pred_f1 = (
+            float((2 * pred_precision * pred_recall) / (pred_precision + pred_recall))
+            if np.isfinite(pred_precision) and np.isfinite(pred_recall) and (pred_precision + pred_recall) > 0
+            else np.nan
+        )
 
         meta.update(
             {
@@ -536,6 +557,7 @@ def _annotate_records_with_ground_truth(
                 "pred_dice": float(pred_dice),
                 "pred_precision": float(pred_precision),
                 "pred_recall": float(pred_recall),
+                "pred_f1": float(pred_f1),
             }
         )
 
@@ -802,13 +824,21 @@ def _save_overlay_plots(
         match_text = str(row.get("match_method", "none"))
         iou_text = row.get("pred_iou", np.nan)
         dice_text = row.get("pred_dice", np.nan)
+        precision_text = row.get("pred_precision", np.nan)
+        recall_text = row.get("pred_recall", np.nan)
+        gene_text = row.get("gene_spearman_r", np.nan)
         quality = ""
         if np.isfinite(float(iou_text)) and np.isfinite(float(dice_text)):
             quality = f"  IoU={float(iou_text):.3f}  Dice={float(dice_text):.3f}"
+        if np.isfinite(float(precision_text)) and np.isfinite(float(recall_text)):
+            quality += f"  P={float(precision_text):.3f}  R={float(recall_text):.3f}"
+        gene_quality = ""
+        if np.isfinite(float(gene_text)):
+            gene_quality = f"  GeneSpearman={float(gene_text):.3f}"
         ax.set_title(
             f"cell={row['cell_id']}  reward={row['total_reward']:.2f}  "
             f"assigned={row['n_assigned_bins']}/{row['n_candidate_bins']}\n"
-            f"GT match={match_text}{quality}"
+            f"GT match={match_text}{quality}{gene_quality}"
         )
         ax.legend(loc="best", fontsize=8, frameon=False)
         fig.tight_layout()
@@ -867,6 +897,8 @@ def main() -> None:
         raise ValueError("--gt-min-nuclear-overlap-bins must be >= 0")
     if (args.gt_cell_bins_path is None) ^ (args.gt_nuclear_bins_path is None):
         raise ValueError("--gt-cell-bins-path and --gt-nuclear-bins-path must be provided together")
+    if (args.gt_cell_assignments_csv is None) ^ (args.gt_sc_expression_h5 is None):
+        raise ValueError("--gt-cell-assignments-csv and --gt-sc-expression-h5 must be provided together")
 
     ckpt_path = Path(args.checkpoint).expanduser().resolve()
     if not ckpt_path.exists():
@@ -955,6 +987,16 @@ def main() -> None:
             min_overlap_bins=int(args.gt_min_nuclear_overlap_bins),
         )
 
+    gt_cell_assignments_csv = None if args.gt_cell_assignments_csv is None else Path(args.gt_cell_assignments_csv).expanduser().resolve()
+    gt_sc_expression_h5 = None if args.gt_sc_expression_h5 is None else Path(args.gt_sc_expression_h5).expanduser().resolve()
+    if gt_cell_assignments_csv is not None and gt_sc_expression_h5 is not None:
+        episode_records = annotate_records_with_gene_correlation(
+            records=episode_records,
+            episodes_index_path=config.episodes_index_path,
+            gt_cell_assignments_csv=gt_cell_assignments_csv,
+            gt_sc_expression_h5=gt_sc_expression_h5,
+        )
+
     episode_records = _write_step_traces(records=episode_records, run_dir=run_dir)
 
     results = [rec.metrics for rec in episode_records]
@@ -980,6 +1022,8 @@ def main() -> None:
         "gt_enabled": bool(gt_enabled),
         "gt_cell_bins_path": None if gt_cell_bins_path is None else str(gt_cell_bins_path),
         "gt_nuclear_bins_path": None if gt_nuclear_bins_path is None else str(gt_nuclear_bins_path),
+        "gt_cell_assignments_csv": None if gt_cell_assignments_csv is None else str(gt_cell_assignments_csv),
+        "gt_sc_expression_h5": None if gt_sc_expression_h5 is None else str(gt_sc_expression_h5),
         "gt_match_mode": "nuclear_overlap",
         "evaluation_timestamp_utc": now_utc.isoformat(),
         "evaluation_timestamp_local": now_local.isoformat(),
@@ -1003,18 +1047,8 @@ def main() -> None:
         matched = df["matched_gt_cell_id"].astype("string").notna()
         summary["matched_gt_fraction"] = float(matched.mean())
         summary["n_matched_gt"] = int(matched.sum())
-    if "pred_iou" in df.columns:
-        valid_iou = pd.to_numeric(df["pred_iou"], errors="coerce")
-        valid_iou = valid_iou[np.isfinite(valid_iou.to_numpy(dtype=np.float64))]
-        if len(valid_iou) > 0:
-            summary["mean_pred_iou"] = float(valid_iou.mean())
-            summary["median_pred_iou"] = float(valid_iou.median())
-    if "pred_dice" in df.columns:
-        valid_dice = pd.to_numeric(df["pred_dice"], errors="coerce")
-        valid_dice = valid_dice[np.isfinite(valid_dice.to_numpy(dtype=np.float64))]
-        if len(valid_dice) > 0:
-            summary["mean_pred_dice"] = float(valid_dice.mean())
-            summary["median_pred_dice"] = float(valid_dice.median())
+    for metric_col in ("pred_iou", "pred_dice", "pred_precision", "pred_recall", "pred_f1", "gene_spearman_r", "gene_rmse"):
+        _add_numeric_summary(summary, df, metric_col)
     if "match_method" in df.columns:
         summary["match_method_counts"] = {
             str(k): int(v) for k, v in df["match_method"].fillna("unmatched").value_counts(dropna=False).items()

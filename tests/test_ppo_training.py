@@ -11,12 +11,16 @@ import yaml
 
 from hd_cell_rl.ppo_training import (
     ConfigError,
+    AddStopCellEnv,
     EpisodeStep,
     EpisodeTrajectory,
+    _build_policy_observation_from_state,
     _build_rollout_buffer,
     _compute_full_grpo_episode_scores,
     _compute_group_relative_episode_advantages,
+    _compute_state_feature_bundle,
     _full_grpo_size_score,
+    _posterior_confidence_delta_per_bin,
     compute_discounted_returns,
     compute_gae_returns_and_advantages,
     load_ppo_training_config,
@@ -208,6 +212,121 @@ class PPOTrainingTests(unittest.TestCase):
             self.assertEqual(scores.shape, (2,))
             self.assertTrue(np.isfinite(scores).all())
 
+    def test_policy_observation_state_upgrade_shapes_are_finite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = load_ppo_training_config(
+                self._write_minimal_config(Path(tmp_dir), batch_cells=2, group_relative_enabled=True)
+            )
+            ctx = self._minimal_episode_context(config)
+            obs = _build_policy_observation_from_state(
+                ctx=ctx,
+                membership_mask=np.asarray([1, 0], dtype=np.uint8),
+                step_index=0,
+            )
+
+        self.assertEqual(obs["global_features"].shape, (AddStopCellEnv.GLOBAL_FEATURE_DIM,))
+        self.assertEqual(obs["action_features"].shape, (3, AddStopCellEnv.ACTION_FEATURE_DIM))
+        self.assertEqual(AddStopCellEnv.GLOBAL_FEATURE_DIM, 11)
+        self.assertEqual(AddStopCellEnv.ACTION_FEATURE_DIM, 13)
+        self.assertTrue(np.isfinite(obs["global_features"]).all())
+        self.assertTrue(np.isfinite(obs["action_features"]).all())
+
+    def test_radial_alignment_is_zero_without_centroid_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = load_ppo_training_config(
+                self._write_minimal_config(Path(tmp_dir), batch_cells=2, group_relative_enabled=True)
+            )
+            ctx = self._minimal_episode_context(config)
+            bundle = _compute_state_feature_bundle(
+                ctx=ctx,
+                membership_mask=np.asarray([1, 0], dtype=np.uint8),
+                step_index=0,
+            )
+
+        np.testing.assert_allclose(bundle.radial_alignment_with_centroid_drift, np.zeros((2,), dtype=np.float32))
+
+    def test_posterior_confidence_delta_rewards_consistent_bins(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = load_ppo_training_config(
+                self._write_minimal_config(Path(tmp_dir), batch_cells=2, group_relative_enabled=True)
+            )
+            ctx = self._minimal_episode_context(config)
+            ctx = ctx.__class__(
+                **{
+                    **ctx.__dict__,
+                    "candidate_bin_ids": ("bin_0", "bin_1", "bin_2"),
+                    "initial_membership_mask": np.asarray([1, 0, 0], dtype=np.uint8),
+                    "candidate_bin_xy_um": np.asarray([[0.0, 0.0], [2.0, 0.0], [4.0, 0.0]], dtype=np.float32),
+                    "ll": np.asarray([[2.0, 0.0], [2.0, 0.0], [0.0, 2.0]], dtype=np.float32),
+                    "p_dis": np.asarray([0.0, 0.1, 0.2], dtype=np.float32),
+                    "p_overlap": np.zeros((3,), dtype=np.float32),
+                    "ll_mean_z": np.asarray([0.5, 0.5, -0.5], dtype=np.float32),
+                    "ll_max_z": np.asarray([0.5, 0.5, -0.5], dtype=np.float32),
+                    "base_penalty": np.asarray([0.0, 0.1, 0.2], dtype=np.float32),
+                    "expression_confidence": np.ones((3,), dtype=np.float32),
+                    "bin_count_totals": np.ones((3,), dtype=np.float32),
+                    "neighbor_index": np.asarray(
+                        [
+                            [-1, -1, -1, -1, 1, -1, -1, -1],
+                            [-1, -1, -1, 0, 2, -1, -1, -1],
+                            [-1, -1, -1, 1, -1, -1, -1, -1],
+                        ],
+                        dtype=np.int32,
+                    ),
+                }
+            )
+
+            delta = _posterior_confidence_delta_per_bin(
+                ctx=ctx,
+                membership_mask=np.asarray([1, 0, 0], dtype=np.uint8),
+            )
+
+        self.assertGreater(float(delta[1]), 0.0)
+        self.assertLess(float(delta[2]), 0.0)
+
+    def test_w5_old_bin_compatibility_contributes_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = load_ppo_training_config(
+                self._write_minimal_config(Path(tmp_dir), batch_cells=2, group_relative_enabled=True)
+            )
+            ctx = self._minimal_episode_context(config)
+            ctx = ctx.__class__(
+                **{
+                    **ctx.__dict__,
+                    "candidate_bin_ids": ("bin_0", "bin_1", "bin_2"),
+                    "initial_membership_mask": np.asarray([1, 0, 0], dtype=np.uint8),
+                    "candidate_bin_xy_um": np.asarray([[0.0, 0.0], [2.0, 0.0], [4.0, 0.0]], dtype=np.float32),
+                    "ll": np.asarray([[2.0, 0.0], [2.0, 0.0], [0.0, 2.0]], dtype=np.float32),
+                    "p_dis": np.zeros((3,), dtype=np.float32),
+                    "p_overlap": np.zeros((3,), dtype=np.float32),
+                    "ll_mean_z": np.zeros((3,), dtype=np.float32),
+                    "ll_max_z": np.zeros((3,), dtype=np.float32),
+                    "base_penalty": np.zeros((3,), dtype=np.float32),
+                    "expression_confidence": np.ones((3,), dtype=np.float32),
+                    "bin_count_totals": np.ones((3,), dtype=np.float32),
+                    "neighbor_index": np.asarray(
+                        [
+                            [-1, -1, -1, -1, 1, -1, -1, -1],
+                            [-1, -1, -1, 0, 2, -1, -1, -1],
+                            [-1, -1, -1, 1, -1, -1, -1, -1],
+                        ],
+                        dtype=np.int32,
+                    ),
+                    "w1": 0.0,
+                    "w4": 0.0,
+                    "w5": 1.0,
+                    "normalize_expression_zscore": False,
+                }
+            )
+
+            bundle = _compute_state_feature_bundle(
+                ctx=ctx,
+                membership_mask=np.asarray([1, 0, 0], dtype=np.uint8),
+                step_index=0,
+            )
+
+        self.assertGreater(float(bundle.add_rewards[1]), float(bundle.add_rewards[2]))
+
     def test_run_ppo_training_smoke_with_full_grpo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -365,6 +484,7 @@ class PPOTrainingTests(unittest.TestCase):
                 "w2": 1.0,
                 "w3": 1.0,
                 "w4": 0.05,
+                "w5": 0.10,
                 "stop_lambda": 0.7,
                 "stop_stat": "topk_mean",
                 "stop_top_k": 2,
@@ -399,6 +519,7 @@ class PPOTrainingTests(unittest.TestCase):
             ll_max_z=np.asarray([0.5, -0.5], dtype=np.float32),
             base_penalty=np.asarray([0.0, 0.1], dtype=np.float32),
             expression_confidence=np.asarray([1.0, 1.0], dtype=np.float32),
+            bin_count_totals=np.asarray([5.0, 4.0], dtype=np.float32),
             neighbor_index=np.asarray([[-1, -1, -1, -1, 1, -1, -1, -1], [-1, -1, -1, 0, -1, -1, -1, -1]], dtype=np.int32),
             max_steps=2,
             log_prior=-np.log(2.0),
@@ -407,6 +528,7 @@ class PPOTrainingTests(unittest.TestCase):
             w2=float(config.w2),
             w3=float(config.w3),
             w4=float(config.w4),
+            w5=float(config.w5),
             stop_lambda=float(config.stop_lambda),
             stop_stat=str(config.stop_stat),
             stop_top_k=int(config.stop_top_k),

@@ -33,6 +33,7 @@ COLOR_OPTIONS: tuple[str, ...] = (
     "reward_total",
     "policy_probability",
     "expr_weighted",
+    "expr_old_weighted",
     "distance_penalty",
     "overlap_penalty",
     "neighbor_bonus",
@@ -40,7 +41,7 @@ COLOR_OPTIONS: tuple[str, ...] = (
     "candidate_compactness_gain",
 )
 
-DEBUG_SESSION_SCHEMA_VERSION = "2026-04-23-bin-expression-v1"
+DEBUG_SESSION_SCHEMA_VERSION = "2026-04-29-w5-expression-v1"
 
 REPLAY_METRIC_HELP: dict[str, str] = {
     "Replay Steps": "Number of decision steps replayed for this cell.",
@@ -70,6 +71,13 @@ STATE_METRIC_HELP: dict[str, str] = {
     "positive_frontier_fraction": "Fraction of frontier bins whose add reward is positive.",
     "centroid_drift_scaled": "Distance from current assigned centroid to nucleus center, scaled by r_max_um.",
     "compactness_proxy": "Average 8-neighbor support among assigned bins. Higher means more connected.",
+    "frontier_add_reward_topk_mean": "Mean of the current top-k frontier add rewards used by STOP.",
+    "frontier_add_reward_mean": "Mean add reward over current frontier bins.",
+    "frontier_add_reward_std": "Std of add reward over current frontier bins.",
+    "frontier_add_reward_max": "Best current frontier add reward.",
+    "seed_compactness": "Average 8-neighbor support inside the initial nuclear seed.",
+    "seed_radius_p90_scaled": "90th percentile seed-bin radius from nucleus center, scaled by r_max_um.",
+    "seed_aspect_ratio_scaled": "Initial seed elongation proxy; 0 is rounder, 1 is more elongated.",
     "value_estimate": "Critic estimate of expected future return from the current state.",
 }
 
@@ -82,10 +90,13 @@ STOP_METRIC_HELP: dict[str, str] = {
 
 REWARD_DECOMP_HELP: dict[str, str] = {
     "reward_total": "Full immediate add reward for this candidate bin.",
-    "expr_raw": "Expression likelihood score before z-scoring and weighting.",
+    "expr_raw": "Posterior-confidence gain from adding this bin before z-scoring and weighting.",
     "expr_conf": "Confidence multiplier from total counts, c / (c + a).",
-    "expr_term": "Expression term after optional frontier z-scoring.",
+    "expr_term": "Posterior-confidence gain term after optional frontier z-scoring.",
     "w1_expr": "Expression contribution after multiplying by w1.",
+    "expr_old_raw": "Old bin-posterior compatibility score before z-scoring and weighting.",
+    "expr_old_term": "Old compatibility term after optional frontier z-scoring.",
+    "w5_expr_old": "Old compatibility helper contribution after multiplying by w5.",
     "w2_p_dis": "Distance penalty contribution from w2 * p_dis.",
     "w3_p_overlap": "Overlap penalty contribution from w3 * p_overlap.",
     "w4_neighbor": "Neighbor-support bonus contribution from w4 * neighbor_support.",
@@ -171,7 +182,7 @@ def _series_color_kwargs(metric_name: str, values: np.ndarray) -> dict[str, Any]
         return {
             "colorscale": "Viridis",
         }
-    if metric_name in {"reward_total", "expr_weighted", "candidate_compactness_gain"}:
+    if metric_name in {"reward_total", "expr_weighted", "expr_old_weighted", "candidate_compactness_gain"}:
         max_abs = float(max(np.max(np.abs(finite)), 1.0e-6))
         return {
             "colorscale": "RdBu",
@@ -730,6 +741,7 @@ def main() -> None:
                 "reward_rank",
                 "probability_rank",
                 "expr_weighted",
+                "expr_old_weighted",
                 "distance_penalty",
                 "overlap_penalty",
                 "neighbor_bonus",
@@ -829,6 +841,13 @@ def main() -> None:
                 "positive_frontier_fraction": state_summary["positive_frontier_fraction"],
                 "centroid_drift_scaled": state_summary["centroid_drift_scaled"],
                 "compactness_proxy": state_summary["compactness_proxy"],
+                "frontier_add_reward_topk_mean": state_summary["frontier_add_reward_topk_mean"],
+                "frontier_add_reward_mean": state_summary["frontier_add_reward_mean"],
+                "frontier_add_reward_std": state_summary["frontier_add_reward_std"],
+                "frontier_add_reward_max": state_summary["frontier_add_reward_max"],
+                "seed_compactness": state_summary["seed_compactness"],
+                "seed_radius_p90_scaled": state_summary["seed_radius_p90_scaled"],
+                "seed_aspect_ratio_scaled": state_summary["seed_aspect_ratio_scaled"],
                 "value_estimate": state_summary["value_estimate"],
             },
         )
@@ -879,6 +898,9 @@ def main() -> None:
                     "expr_conf": float(chosen_row["expr_confidence"]),
                     "expr_term": float(chosen_row["expr_term"]),
                     "w1_expr": float(chosen_row["expr_weighted"]),
+                    "expr_old_raw": float(chosen_row["expr_old_raw"]),
+                    "expr_old_term": float(chosen_row["expr_old_term"]),
+                    "w5_expr_old": float(chosen_row["expr_old_weighted"]),
                     "w2_p_dis": float(chosen_row["distance_penalty"]),
                     "w3_p_overlap": float(chosen_row["overlap_penalty"]),
                     "w4_neighbor": float(chosen_row["neighbor_bonus"]),

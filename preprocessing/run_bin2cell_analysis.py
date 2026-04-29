@@ -220,6 +220,20 @@ def parse_args():
     )
 
     parser.add_argument(
+        '--gt_cell_assignments_csv',
+        type=str,
+        default=None,
+        help='Optional pseudo-data cell_id to sc_cell_barcode mapping for gene correlation'
+    )
+
+    parser.add_argument(
+        '--gt_sc_expression_h5',
+        type=str,
+        default=None,
+        help='Optional ground-truth single-cell expression H5 for gene correlation'
+    )
+
+    parser.add_argument(
         '--gt_min_nuclear_overlap_frac',
         type=float,
         default=0.3,

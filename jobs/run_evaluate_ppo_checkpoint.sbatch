@@ -5,8 +5,8 @@
 #SBATCH --time=72:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=96
-#SBATCH --mem=800G
+#SBATCH --cpus-per-task=48
+#SBATCH --mem=400G
 #SBATCH --output=evaluate_ppo_checkpoint.out
 #SBATCH --error=evaluate_ppo_checkpoint.err
 
@@ -30,7 +30,7 @@ export TORCH_NUM_INTEROP_THREADS=1
 unset KMP_LOGFILE || true
 unset LOGFILE || true
 
-CHECKPOINT_PATH="${CHECKPOINT_PATH:-runs/human_colorectal_full_grpo_20260424T193456Z/checkpoints/best_model.pt}"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-runs/human_colorectal_full_grpo_20260428T195942Z/checkpoints/best_model.pt}"
 PPO_CONFIG="${PPO_CONFIG:-}"
 EPISODES_INDEX_PATH="${EPISODES_INDEX_PATH:-}"
 MAX_EPISODES="${MAX_EPISODES:-300}"
@@ -43,6 +43,8 @@ OVERLAY_MAX_CELLS="${OVERLAY_MAX_CELLS:-300}"
 OVERLAY_SELECTION="${OVERLAY_SELECTION:-top_reward}"
 GT_CELL_BINS_PATH="${GT_CELL_BINS_PATH:-workspace_outputs/pseudo_human_colorectal/intermediate/cropped_visium_hd_human_colorectal_pseudo_square_002um_cell_bins.csv.gz}"
 GT_NUCLEAR_BINS_PATH="${GT_NUCLEAR_BINS_PATH:-workspace_outputs/pseudo_human_colorectal/intermediate/cropped_visium_hd_human_colorectal_pseudo_square_002um_nuclear_bins.csv.gz}"
+GT_CELL_ASSIGNMENTS_CSV="${GT_CELL_ASSIGNMENTS_CSV:-colorectal_pseudo_visium_hd_output_full_0.25/ground_truth_cell_assignments.csv}"
+GT_SC_EXPRESSION_H5="${GT_SC_EXPRESSION_H5:-colorectal_sc_data/CRC_GSE166555_raw_tumor.h5}"
 GT_MIN_NUCLEAR_OVERLAP_FRAC="${GT_MIN_NUCLEAR_OVERLAP_FRAC:-0.3}"
 GT_MIN_NUCLEAR_OVERLAP_BINS="${GT_MIN_NUCLEAR_OVERLAP_BINS:-2}"
 
@@ -70,6 +72,8 @@ echo "OVERLAY_MAX_CELLS: $OVERLAY_MAX_CELLS"
 echo "OVERLAY_SELECTION: $OVERLAY_SELECTION"
 echo "GT_CELL_BINS_PATH: $GT_CELL_BINS_PATH"
 echo "GT_NUCLEAR_BINS_PATH: $GT_NUCLEAR_BINS_PATH"
+echo "GT_CELL_ASSIGNMENTS_CSV: $GT_CELL_ASSIGNMENTS_CSV"
+echo "GT_SC_EXPRESSION_H5: $GT_SC_EXPRESSION_H5"
 echo "GT_MIN_NUCLEAR_OVERLAP_FRAC: $GT_MIN_NUCLEAR_OVERLAP_FRAC"
 echo "GT_MIN_NUCLEAR_OVERLAP_BINS: $GT_MIN_NUCLEAR_OVERLAP_BINS"
 
@@ -85,6 +89,8 @@ CMD=(python scripts/evaluate_ppo_checkpoint.py
   --overlay-selection "$OVERLAY_SELECTION"
   --gt-cell-bins-path "$GT_CELL_BINS_PATH"
   --gt-nuclear-bins-path "$GT_NUCLEAR_BINS_PATH"
+  --gt-cell-assignments-csv "$GT_CELL_ASSIGNMENTS_CSV"
+  --gt-sc-expression-h5 "$GT_SC_EXPRESSION_H5"
   --gt-min-nuclear-overlap-frac "$GT_MIN_NUCLEAR_OVERLAP_FRAC"
   --gt-min-nuclear-overlap-bins "$GT_MIN_NUCLEAR_OVERLAP_BINS"
 )

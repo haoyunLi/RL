@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import h5py
 import json
 import logging
 import re
@@ -17,11 +18,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import yaml
+from scipy.stats import spearmanr
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from hd_cell_rl.matrix_io import resolve_matrix_csc_h5_path
 from hd_cell_rl.reward import compute_reference_distribution
 from hd_cell_rl.reward_grid_search import (
     _MatrixOnDemandExpressionLoader,
@@ -36,6 +39,146 @@ logger = logging.getLogger(__name__)
 
 _LOCAL_TIMEZONE = ZoneInfo("America/Chicago")
 _LOCAL_TIMEZONE_NAME = "America/Chicago"
+
+
+def _decode_h5_strings(values: np.ndarray) -> list[str]:
+    out: list[str] = []
+    for value in values:
+        if isinstance(value, bytes):
+            out.append(value.decode("utf-8"))
+        else:
+            out.append(str(value))
+    return out
+
+
+def _load_10x_feature_names(matrix_path: Path) -> list[str]:
+    resolved_path = resolve_matrix_csc_h5_path(matrix_path)
+    with h5py.File(resolved_path, "r") as h5:
+        return _decode_h5_strings(h5["matrix/features/name"][:])
+
+
+def _common_genes_in_spatial_order(spatial_matrix_path: Path, sc_expression_h5: Path) -> list[str]:
+    spatial_genes = _load_10x_feature_names(spatial_matrix_path)
+    sc_genes = set(_load_10x_feature_names(sc_expression_h5))
+    common: list[str] = []
+    seen: set[str] = set()
+    for gene in spatial_genes:
+        gene = str(gene)
+        if gene in sc_genes and gene not in seen:
+            common.append(gene)
+            seen.add(gene)
+    return common
+
+
+def _load_gt_cell_assignment_map(path: Path) -> dict[str, dict[str, str]]:
+    df = pd.read_csv(path)
+    required = {"cell_id", "sc_cell_barcode"}
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f"GT cell assignment CSV missing columns: {sorted(missing)}")
+    df["cell_id"] = df["cell_id"].map(normalize_cell_id)
+    df = df.loc[df["cell_id"].notna()].copy()
+    mapping: dict[str, dict[str, str]] = {}
+    for row in df.itertuples(index=False):
+        cell_id = str(getattr(row, "cell_id"))
+        entry = {"sc_cell_barcode": str(getattr(row, "sc_cell_barcode"))}
+        if "cell_type" in df.columns:
+            entry["cell_type"] = str(getattr(row, "cell_type"))
+        mapping[cell_id] = entry
+    return mapping
+
+
+def _safe_gene_spearman(pred_expr: np.ndarray, gt_expr: np.ndarray) -> float:
+    pred = np.asarray(pred_expr, dtype=np.float64)
+    gt = np.asarray(gt_expr, dtype=np.float64)
+    if pred.shape != gt.shape or pred.size < 2:
+        return np.nan
+    if float(np.sum(pred)) <= 0.0 or float(np.sum(gt)) <= 0.0:
+        return np.nan
+    if float(np.std(pred)) <= 0.0 or float(np.std(gt)) <= 0.0:
+        return np.nan
+    corr, _ = spearmanr(pred, gt)
+    return float(corr) if np.isfinite(corr) else np.nan
+
+
+def annotate_records_with_gene_correlation(
+    *,
+    records: list[Any],
+    episodes_index_path: Path,
+    gt_cell_assignments_csv: Path | None,
+    gt_sc_expression_h5: Path | None,
+) -> list[Any]:
+    """Attach per-cell gene correlation against pseudo-data source single cells."""
+    if gt_cell_assignments_csv is None or gt_sc_expression_h5 is None:
+        return records
+    if not records:
+        return records
+    if not gt_cell_assignments_csv.exists():
+        raise FileNotFoundError(f"GT cell assignment CSV not found: {gt_cell_assignments_csv}")
+    if not gt_sc_expression_h5.exists():
+        raise FileNotFoundError(f"GT single-cell expression H5 not found: {gt_sc_expression_h5}")
+
+    expression_context = _load_episode_build_expression_context(episodes_index_path)
+    if expression_context is None:
+        raise ValueError(f"could not resolve episode-build expression context from {episodes_index_path}")
+    spatial_matrix_path = Path(str(expression_context["matrix_path"])).expanduser().resolve()
+
+    common_genes = _common_genes_in_spatial_order(spatial_matrix_path, gt_sc_expression_h5)
+    if len(common_genes) < 10:
+        logger.warning("Skipping gene correlation; only %d common genes found", len(common_genes))
+        return records
+
+    gt_assignment = _load_gt_cell_assignment_map(gt_cell_assignments_csv)
+    spatial_reader = _TenXColumnExpressionReader(spatial_matrix_path, common_genes)
+    sc_reader = _TenXColumnExpressionReader(gt_sc_expression_h5, common_genes)
+    updated: list[Any] = []
+    try:
+        for rec in records:
+            metrics = dict(rec.metrics)
+            matched_gt_cell_id = normalize_cell_id(metrics.get("matched_gt_cell_id"))
+            gt_meta = gt_assignment.get(str(matched_gt_cell_id)) if matched_gt_cell_id is not None else None
+            assigned_mask = np.asarray(rec.final_membership_mask, dtype=np.uint8) == 1
+            pred_barcodes = [
+                str(barcode)
+                for i, barcode in enumerate(rec.candidate_bin_ids)
+                if i < assigned_mask.shape[0] and bool(assigned_mask[i])
+            ]
+
+            gene_metrics: dict[str, Any] = {
+                "gene_common_count": int(len(common_genes)),
+                "gt_sc_barcode": None,
+                "gt_cell_type": None,
+                "gene_spearman_r": np.nan,
+                "gene_rmse": np.nan,
+                "pred_gene_total_counts": np.nan,
+                "gt_gene_total_counts": np.nan,
+                "pred_genes_detected": np.nan,
+                "gt_genes_detected": np.nan,
+            }
+
+            if gt_meta is not None and pred_barcodes:
+                sc_barcode = str(gt_meta["sc_cell_barcode"])
+                pred_expr = spatial_reader.sum_barcodes(pred_barcodes)
+                gt_expr = sc_reader.sum_barcodes([sc_barcode])
+                gene_metrics.update(
+                    {
+                        "gt_sc_barcode": sc_barcode,
+                        "gt_cell_type": gt_meta.get("cell_type"),
+                        "gene_spearman_r": _safe_gene_spearman(pred_expr, gt_expr),
+                        "gene_rmse": float(np.sqrt(np.mean((pred_expr - gt_expr) ** 2))),
+                        "pred_gene_total_counts": float(np.sum(pred_expr)),
+                        "gt_gene_total_counts": float(np.sum(gt_expr)),
+                        "pred_genes_detected": int(np.count_nonzero(pred_expr > 0)),
+                        "gt_genes_detected": int(np.count_nonzero(gt_expr > 0)),
+                    }
+                )
+
+            updated.append(replace(rec, metrics={**metrics, **gene_metrics}))
+    finally:
+        spatial_reader.close()
+        sc_reader.close()
+
+    return updated
 
 
 @dataclass(frozen=True)
@@ -55,6 +198,61 @@ class EpisodeGeometry:
     candidate_bin_ids: tuple[str, ...]
     candidate_bin_xy_um: np.ndarray
     nucleus_center_xy_um: np.ndarray
+
+
+class _TenXColumnExpressionReader:
+    """Read selected-gene 10x CSC columns by barcode and sum them."""
+
+    def __init__(self, matrix_path: Path, selected_gene_names: list[str]) -> None:
+        resolved_path = resolve_matrix_csc_h5_path(matrix_path)
+        self._h5 = h5py.File(resolved_path, "r")
+        matrix = self._h5["matrix"]
+        feature_names = _decode_h5_strings(matrix["features"]["name"][:])
+        barcodes = _decode_h5_strings(matrix["barcodes"][:])
+        shape = tuple(int(x) for x in matrix["shape"][:].tolist())
+        self._n_features = int(shape[0])
+        self._n_cols = int(shape[1])
+        self._data = matrix["data"]
+        self._indices = matrix["indices"]
+        self._indptr = np.asarray(matrix["indptr"][:], dtype=np.int64)
+        self._barcode_to_col = {str(barcode): i for i, barcode in enumerate(barcodes)}
+
+        first_idx: dict[str, int] = {}
+        for idx, name in enumerate(feature_names):
+            first_idx.setdefault(str(name), int(idx))
+        selected_indices = [first_idx[g] for g in selected_gene_names if g in first_idx]
+        if len(selected_indices) != len(selected_gene_names):
+            missing = sorted(set(selected_gene_names) - set(first_idx))
+            raise ValueError(f"selected genes missing from matrix {resolved_path}: {missing[:5]}")
+
+        lookup = np.full(self._n_features, -1, dtype=np.int32)
+        lookup[np.asarray(selected_indices, dtype=np.int64)] = np.arange(len(selected_indices), dtype=np.int32)
+        self._feature_lookup = lookup
+        self.expression_dim = int(len(selected_indices))
+
+    def close(self) -> None:
+        try:
+            self._h5.close()
+        except Exception:
+            pass
+
+    def sum_barcodes(self, barcodes: list[str] | tuple[str, ...] | set[str]) -> np.ndarray:
+        out = np.zeros((self.expression_dim,), dtype=np.float64)
+        for barcode in barcodes:
+            col = self._barcode_to_col.get(str(barcode))
+            if col is None:
+                continue
+            start = int(self._indptr[col])
+            end = int(self._indptr[col + 1])
+            if end <= start:
+                continue
+            feature_idx = np.asarray(self._indices[start:end], dtype=np.int64)
+            values = np.asarray(self._data[start:end], dtype=np.float64)
+            selected_pos = self._feature_lookup[feature_idx]
+            keep = selected_pos >= 0
+            if np.any(keep):
+                np.add.at(out, selected_pos[keep].astype(np.int64, copy=False), values[keep])
+        return out
 
 
 def _slug(value: str) -> str:
@@ -460,11 +658,26 @@ def annotate_records_with_ground_truth(
             if int(chosen) == 1
         }
         gt_barcodes = gt_barcodes_by_cell.get(str(matched_gt_cell_id), set()) if matched_gt_cell_id is not None else set()
-        intersection = len(assigned_barcodes & gt_barcodes)
-        union = len(assigned_barcodes | gt_barcodes)
-        pred_iou = float(intersection / union) if union > 0 else np.nan
-        denom = len(assigned_barcodes) + len(gt_barcodes)
-        pred_dice = float((2 * intersection) / denom) if denom > 0 else np.nan
+        intersection = 0
+        union = 0
+        pred_iou = np.nan
+        pred_dice = np.nan
+        pred_precision = np.nan
+        pred_recall = np.nan
+        pred_f1 = np.nan
+        if matched_gt_cell_id is not None:
+            intersection = len(assigned_barcodes & gt_barcodes)
+            union = len(assigned_barcodes | gt_barcodes)
+            pred_iou = float(intersection / union) if union > 0 else np.nan
+            denom = len(assigned_barcodes) + len(gt_barcodes)
+            pred_dice = float((2 * intersection) / denom) if denom > 0 else np.nan
+            pred_precision = float(intersection / len(assigned_barcodes)) if len(assigned_barcodes) > 0 else 0.0
+            pred_recall = float(intersection / len(gt_barcodes)) if len(gt_barcodes) > 0 else 0.0
+            pred_f1 = (
+                float((2 * pred_precision * pred_recall) / (pred_precision + pred_recall))
+                if (pred_precision + pred_recall) > 0
+                else 0.0
+            )
         gt_cell_xy = gt_xy_by_cell.get(str(matched_gt_cell_id)) if matched_gt_cell_id is not None else None
         gt_nuclear_xy = gt_nuclear_xy_by_cell.get(str(matched_gt_cell_id)) if matched_gt_cell_id is not None else None
         updated.append(
@@ -478,8 +691,12 @@ def annotate_records_with_ground_truth(
                     "gt_nuclear_overlap_frac_episode": float(meta.get("pred_nuclear_overlap_frac_episode", np.nan)),
                     "pred_iou": pred_iou,
                     "pred_dice": pred_dice,
+                    "pred_precision": pred_precision,
+                    "pred_recall": pred_recall,
+                    "pred_f1": pred_f1,
                     "gt_assigned_intersection": int(intersection),
                     "gt_assigned_union": int(union),
+                    "pred_n_bins": int(len(assigned_barcodes)),
                     "gt_n_bins": int(len(gt_barcodes)),
                 },
                 gt_cell_xy_um=None if gt_cell_xy is None else np.asarray(gt_cell_xy, dtype=np.float32),
@@ -506,6 +723,19 @@ def _choose_overlay_indices(df: pd.DataFrame, n_pick: int, selection: str, seed:
     rng = np.random.default_rng(int(seed))
     choices = rng.choice(len(df), size=n_pick, replace=False)
     return [int(i) for i in np.asarray(choices, dtype=np.int64)]
+
+
+def _add_numeric_summary(summary: dict[str, Any], df: pd.DataFrame, column: str, prefix: str = "") -> None:
+    if column not in df.columns:
+        return
+    values = pd.to_numeric(df[column], errors="coerce")
+    values = values[np.isfinite(values.to_numpy(dtype=np.float64))]
+    if len(values) == 0:
+        return
+    key = f"{prefix}{column}" if prefix else column
+    summary[f"mean_{key}"] = float(values.mean())
+    summary[f"median_{key}"] = float(values.median())
+    summary[f"n_valid_{key}"] = int(len(values))
 
 
 def _estimate_grid_step(coords: np.ndarray) -> float:
@@ -701,12 +931,20 @@ def save_overlay_plots(
         quality = ""
         iou_text = row.get("pred_iou", np.nan)
         dice_text = row.get("pred_dice", np.nan)
+        precision_text = row.get("pred_precision", np.nan)
+        recall_text = row.get("pred_recall", np.nan)
+        gene_text = row.get("gene_spearman_r", np.nan)
         if np.isfinite(float(iou_text)) and np.isfinite(float(dice_text)):
             quality = f"  IoU={float(iou_text):.3f}  Dice={float(dice_text):.3f}"
+        if np.isfinite(float(precision_text)) and np.isfinite(float(recall_text)):
+            quality += f"  P={float(precision_text):.3f}  R={float(recall_text):.3f}"
+        gene_quality = ""
+        if np.isfinite(float(gene_text)):
+            gene_quality = f"  GeneSpearman={float(gene_text):.3f}"
         ax.set_title(
             f"cell={row['cell_id']}  {method_label.lower()}={row.get('matched_pred_cell_id', 'unmatched')}  "
             f"assigned={row['n_assigned_bins']}/{row['n_candidate_bins']}\n"
-            f"GT match={row.get('match_method', 'none')}{quality}"
+            f"GT match={row.get('match_method', 'none')}{quality}{gene_quality}"
         )
         ax.legend(loc="best", fontsize=8, frameon=False)
         fig.tight_layout()
@@ -822,6 +1060,26 @@ def run_ppo_format_assignment_evaluation(
             min_overlap_bins=int(args.gt_min_nuclear_overlap_bins),
         )
 
+    gt_cell_assignments_csv = (
+        None
+        if getattr(args, "gt_cell_assignments_csv", None) is None
+        else Path(str(args.gt_cell_assignments_csv)).expanduser().resolve()
+    )
+    gt_sc_expression_h5 = (
+        None
+        if getattr(args, "gt_sc_expression_h5", None) is None
+        else Path(str(args.gt_sc_expression_h5)).expanduser().resolve()
+    )
+    if (gt_cell_assignments_csv is None) ^ (gt_sc_expression_h5 is None):
+        raise ValueError("gt_cell_assignments_csv and gt_sc_expression_h5 must be provided together")
+    if gt_cell_assignments_csv is not None and gt_sc_expression_h5 is not None:
+        records = annotate_records_with_gene_correlation(
+            records=records,
+            episodes_index_path=episodes_index_path,
+            gt_cell_assignments_csv=gt_cell_assignments_csv,
+            gt_sc_expression_h5=gt_sc_expression_h5,
+        )
+
     out_root = Path(str(args.eval_output_root)).expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
     now_utc, now_local = _now_utc_and_local()
@@ -854,6 +1112,8 @@ def run_ppo_format_assignment_evaluation(
         "gt_enabled": bool(gt_enabled),
         "gt_cell_bins_path": None if gt_cell_bins_path is None else str(gt_cell_bins_path),
         "gt_nuclear_bins_path": None if gt_nuclear_bins_path is None else str(gt_nuclear_bins_path),
+        "gt_cell_assignments_csv": None if gt_cell_assignments_csv is None else str(gt_cell_assignments_csv),
+        "gt_sc_expression_h5": None if gt_sc_expression_h5 is None else str(gt_sc_expression_h5),
         "gt_match_mode": "nuclear_overlap",
         "pred_match_mode": f"{method_name}_nuclear_overlap",
         "evaluation_timestamp_utc": now_utc.isoformat(),
@@ -881,12 +1141,10 @@ def run_ppo_format_assignment_evaluation(
         n_gt_matched = int(matched_gt.sum())
         if n_gt_matched > 0:
             summary["matched_pred_fraction_among_gt_matched"] = float((matched_pred & matched_gt).sum() / n_gt_matched)
+    for metric_col in ("pred_iou", "pred_dice", "pred_precision", "pred_recall", "pred_f1", "gene_spearman_r", "gene_rmse"):
+        _add_numeric_summary(summary, df, metric_col)
     if "pred_iou" in df.columns:
         iou_series = pd.to_numeric(df["pred_iou"], errors="coerce")
-        valid_iou = iou_series[np.isfinite(iou_series.to_numpy(dtype=np.float64))]
-        if len(valid_iou) > 0:
-            summary["mean_pred_iou"] = float(valid_iou.mean())
-            summary["median_pred_iou"] = float(valid_iou.median())
         if matched_pred is not None:
             matched_pred_iou = iou_series.loc[matched_pred]
             matched_pred_iou = matched_pred_iou[np.isfinite(matched_pred_iou.to_numpy(dtype=np.float64))]
@@ -896,10 +1154,6 @@ def run_ppo_format_assignment_evaluation(
                 summary["matched_pred_only_median_pred_iou"] = float(matched_pred_iou.median())
     if "pred_dice" in df.columns:
         dice_series = pd.to_numeric(df["pred_dice"], errors="coerce")
-        valid_dice = dice_series[np.isfinite(dice_series.to_numpy(dtype=np.float64))]
-        if len(valid_dice) > 0:
-            summary["mean_pred_dice"] = float(valid_dice.mean())
-            summary["median_pred_dice"] = float(valid_dice.median())
         if matched_pred is not None:
             matched_pred_dice = dice_series.loc[matched_pred]
             matched_pred_dice = matched_pred_dice[np.isfinite(matched_pred_dice.to_numpy(dtype=np.float64))]
@@ -932,6 +1186,8 @@ def run_ppo_format_assignment_evaluation(
             "pred_min_nuclear_overlap_bins": int(args.pred_min_nuclear_overlap_bins),
             "gt_cell_bins_path": None if gt_cell_bins_path is None else str(gt_cell_bins_path),
             "gt_nuclear_bins_path": None if gt_nuclear_bins_path is None else str(gt_nuclear_bins_path),
+            "gt_cell_assignments_csv": None if gt_cell_assignments_csv is None else str(gt_cell_assignments_csv),
+            "gt_sc_expression_h5": None if gt_sc_expression_h5 is None else str(gt_sc_expression_h5),
             "gt_min_nuclear_overlap_frac": float(args.gt_min_nuclear_overlap_frac),
             "gt_min_nuclear_overlap_bins": int(args.gt_min_nuclear_overlap_bins),
         },
