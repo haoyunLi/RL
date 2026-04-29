@@ -1,7 +1,24 @@
-# Bin2cell RL Runbook
+# HD Cell RL Runbook
 
-This runbook lists the execution order for preprocessing, episode building, reward search, weight selection, and fixed-weight evaluation.
+This runbook lists the execution order for preprocessing, episode building, reward search, PPO/GRPO training, checkpoint evaluation, and method-baseline comparison.
 Each step depends on outputs from earlier steps, so run in order unless you already have the required files.
+
+Current main training path:
+- Build episodes once.
+- Train with `jobs/run_ppo_training_full_grpo_cpu.sbatch`.
+- Evaluate checkpoints with `jobs/run_evaluate_ppo_checkpoint.sbatch`.
+- Compare Bin2Cell, SMURF, and STCS using the same PPO-evaluation cell set and the same PPO-aligned nuclear seeds.
+
+Current ADD reward expression mixture:
+```text
+ADD reward =
+  w1 * zscore(new posterior-confidence gain over frontier)
++ w5 * zscore(old bin-posterior compatibility over frontier)
+- w2 * distance_penalty
+- w3 * overlap_penalty
++ w4 * neighbor_support
+```
+Default full-GRPO config uses `w1: 0.45` and `w5: 0.10`.
 
 ## 1) Crop Visium HD image
 This step extracts the tissue region used for all downstream processing.
@@ -160,3 +177,162 @@ Optional sbatch:
 ```bash
 sbatch --export=ALL,EPISODE_RUN_DIR="runs/human_colorectal_episode_build_20260305T212758Z",W1=0.9,W2=0.7,W3=0.9,STOP_LAMBDA=0.9,MAX_EPISODES=200,N_WORKERS=32,EVAL_SEED=123,RUN_NAME=reward_eval_val_best jobs/run_evaluate_reward_weights.sbatch
 ```
+
+## 11) Train PPO / GRPO policy
+The current preferred training job is full-GRPO on CPU. It uses `configs/ppo_training.full_grpo.yaml`, keeps the policy input dimensions at `global=11` and `action=13`, and uses the current `w1 + w5` expression reward mixture.
+
+Run with the latest episode build:
+```bash
+sbatch jobs/run_ppo_training_full_grpo_cpu.sbatch
+```
+
+Run with a specific episode build:
+```bash
+EP_RUN="runs/human_colorectal_episode_build_YYYYMMDDTHHMMSSZ"
+sbatch --export=ALL,EPISODE_RUN_DIR="$EP_RUN" jobs/run_ppo_training_full_grpo_cpu.sbatch
+```
+
+Useful overrides:
+```bash
+sbatch --export=ALL,EPISODE_RUN_DIR="$EP_RUN",BATCH_CELLS=200,MAX_UPDATES=600,RUN_NAME=human_colorectal_full_grpo jobs/run_ppo_training_full_grpo_cpu.sbatch
+```
+
+Alternative training configs:
+- `configs/ppo_training.template.yaml`: PPO config.
+- `configs/ppo_training.grpo.yaml`: PPO with optional same-cell group-relative auxiliary.
+- `configs/ppo_training.full_grpo.yaml`: current full-GRPO training path.
+
+Expected outputs:
+- `runs/human_colorectal_full_grpo_*/checkpoints/best_model.pt`
+- `runs/human_colorectal_full_grpo_*/checkpoints/final_model.pt`
+- `runs/human_colorectal_full_grpo_*/summary.json`
+- `runs/human_colorectal_full_grpo_*/logs/steps.jsonl`
+
+## 12) Evaluate PPO / GRPO checkpoint
+This evaluates a trained policy on the episode set, writes per-cell metrics, overlays, IoU distribution plots, and optional gene-correlation metrics against pseudo GT single-cell expression.
+
+Run:
+```bash
+CHECKPOINT_PATH="runs/human_colorectal_full_grpo_YYYYMMDDTHHMMSSZ/checkpoints/best_model.pt"
+sbatch --export=ALL,CHECKPOINT_PATH="$CHECKPOINT_PATH" jobs/run_evaluate_ppo_checkpoint.sbatch
+```
+
+Common overrides:
+```bash
+sbatch --export=ALL,\
+CHECKPOINT_PATH="$CHECKPOINT_PATH",\
+MAX_EPISODES=300,\
+POLICY_MODE=greedy,\
+RUN_DEVICE=cpu,\
+EVAL_SEED=7,\
+OVERLAY_MAX_CELLS=300,\
+OVERLAY_SELECTION=top_reward \
+jobs/run_evaluate_ppo_checkpoint.sbatch
+```
+
+Expected outputs:
+- `runs/human_colorectal_ppo_eval_*/summary.json`
+- `runs/human_colorectal_ppo_eval_*/per_episode.csv`
+- `runs/human_colorectal_ppo_eval_*/overlays/`
+- IoU distribution/CDF plots in the evaluation run directory.
+
+Notes:
+- Set `CHECKPOINT_PATH` manually; do not rely on implicit checkpoint discovery for final comparisons.
+- Use the same `PPO_EVAL_RUN_DIR` from this step when comparing Bin2Cell, SMURF, and STCS so all methods use the same cell set.
+
+## 13) Interactive PPO debug app
+Use this after checkpoint evaluation to inspect one cell step-by-step, including assigned/frontier bins, GT outline, policy probability, reward decomposition, and selected-gene expression for clicked bins.
+
+Run on a compute node:
+```bash
+PPO_EVAL_RUN_DIR="runs/human_colorectal_ppo_eval_YYYYMMDDTHHMMSSZ"
+sbatch --export=ALL,PPO_EVAL_RUN_DIR="$PPO_EVAL_RUN_DIR",RUN_DEVICE=cpu jobs/run_ppo_debug_app.sbatch
+```
+
+The job prints a LAN URL and an SSH tunnel command. If direct LAN access is blocked, use the printed SSH tunnel and open `http://localhost:<port>`.
+
+## 14) Run Bin2Cell / SMURF / STCS baselines with PPO-aligned nuclei
+These method jobs are configured to use the same PPO-aligned nuclear bins instead of each tool's independent nuclear segmentation whenever possible. This keeps method comparison on the same nuclear seed level.
+
+All three method jobs can evaluate against the same PPO checkpoint-evaluation cell set by setting `PPO_EVAL_RUN_DIR`.
+
+### Bin2Cell
+```bash
+PPO_EVAL_RUN_DIR="runs/human_colorectal_ppo_eval_YYYYMMDDTHHMMSSZ"
+sbatch --export=ALL,PPO_EVAL_RUN_DIR="$PPO_EVAL_RUN_DIR" jobs/run_bin2cell.sbatch
+```
+
+Key behavior:
+- Uses `EXTERNAL_NUCLEAR_BINS_PATH` to inject PPO-aligned `labels_he`.
+- Skips Bin2Cell's own H&E nuclear segmentation when external nuclei are provided.
+- Still runs Bin2Cell expansion/GEX/combine steps.
+
+Main outputs:
+- `workspace_outputs/pseudo_human_colorectal/bin2cell_results_colorectal_0.25/human_colorectal_bin2cell_assignments.csv`
+- `runs/human_colorectal_bin2cell_eval_*/summary.json`
+- `runs/human_colorectal_bin2cell_eval_*/overlays/`
+
+### SMURF
+```bash
+PPO_EVAL_RUN_DIR="runs/human_colorectal_ppo_eval_YYYYMMDDTHHMMSSZ"
+sbatch --export=ALL,PPO_EVAL_RUN_DIR="$PPO_EVAL_RUN_DIR" jobs/run_smurf.sbatch
+```
+
+Key behavior:
+- Uses `EXTERNAL_NUCLEAR_BINS_PATH` for PPO-aligned nuclear seeds.
+- Writes PPO-format assignment outputs and evaluation summaries.
+
+Main outputs:
+- `workspace_outputs/pseudo_human_colorectal/smurf_results_colorectal_0.25/human_colorectal_smurf_assignments.csv`
+- `runs/human_colorectal_smurf_eval_*/summary.json`
+- `runs/human_colorectal_smurf_eval_*/overlays/`
+
+### STCS
+Set up the STCS environment once:
+```bash
+sbatch jobs/setup_stcs_env.sbatch
+```
+
+Then run STCS:
+```bash
+PPO_EVAL_RUN_DIR="runs/human_colorectal_ppo_eval_YYYYMMDDTHHMMSSZ"
+sbatch --export=ALL,PPO_EVAL_RUN_DIR="$PPO_EVAL_RUN_DIR" jobs/run_stcs.sbatch
+```
+
+Key behavior:
+- Uses `EXTERNAL_NUCLEAR_BINS_PATH` for PPO-aligned nuclear seeds.
+- By default uses `RESTRICT_TO_EVAL_CELLS=true` and `EVAL_CONTEXT_RADIUS_BINS=10` to reduce memory while preserving nearby competitor nuclei.
+
+Main outputs:
+- `workspace_outputs/pseudo_human_colorectal/stcs_results_colorectal_0.25/human_colorectal_stcs_assignments.csv`
+- `runs/human_colorectal_stcs_eval_*/summary.json`
+- `runs/human_colorectal_stcs_eval_*/overlays/`
+
+## 15) Re-run method evaluation only
+If Bin2Cell, SMURF, or STCS assignments already exist, use this job to re-run only PPO-format evaluation without re-running the full method pipeline.
+
+Run all available methods:
+```bash
+PPO_EVAL_RUN_DIR="runs/human_colorectal_ppo_eval_YYYYMMDDTHHMMSSZ"
+sbatch --export=ALL,PPO_EVAL_RUN_DIR="$PPO_EVAL_RUN_DIR" jobs/run_method_ppo_eval_only.sbatch
+```
+
+Run one method only:
+```bash
+sbatch --export=ALL,\
+PPO_EVAL_RUN_DIR="$PPO_EVAL_RUN_DIR",\
+RUN_BIN2CELL=true,\
+RUN_SMURF=false,\
+RUN_STCS=false \
+jobs/run_method_ppo_eval_only.sbatch
+```
+
+The shared evaluator writes consistent fields across PPO, Bin2Cell, SMURF, and STCS:
+- matched-cell count
+- IoU = intersection / union
+- precision = intersection / predicted bins
+- recall = intersection / GT bins
+- Dice
+- size ratio
+- per-cell and summary gene-correlation metrics when GT single-cell expression is provided
+- overlay plots with predicted bins and GT outline

@@ -731,6 +731,43 @@ def _build_gt_contour_grid(xy: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.n
     return x_coords, y_coords, grid
 
 
+def _finite_float_or_none(value: Any) -> float | None:
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return None
+    return val if np.isfinite(val) else None
+
+
+def _format_overlay_title(row: dict[str, Any]) -> str:
+    lines = [
+        f"cell={row['cell_id']}  reward={row['total_reward']:.2f}  "
+        f"assigned={row['n_assigned_bins']}/{row['n_candidate_bins']}",
+        f"GT match={row.get('match_method', 'none')}",
+    ]
+
+    iou = _finite_float_or_none(row.get("pred_iou", np.nan))
+    dice = _finite_float_or_none(row.get("pred_dice", np.nan))
+    precision = _finite_float_or_none(row.get("pred_precision", np.nan))
+    recall = _finite_float_or_none(row.get("pred_recall", np.nan))
+    metric_parts: list[str] = []
+    if iou is not None:
+        metric_parts.append(f"IoU={iou:.3f}")
+    if dice is not None:
+        metric_parts.append(f"Dice={dice:.3f}")
+    if precision is not None:
+        metric_parts.append(f"P={precision:.3f}")
+    if recall is not None:
+        metric_parts.append(f"R={recall:.3f}")
+    if metric_parts:
+        lines.append("  ".join(metric_parts))
+
+    gene = _finite_float_or_none(row.get("gene_spearman_r", np.nan))
+    if gene is not None:
+        lines.append(f"Gene Spearman={gene:.3f}")
+    return "\n".join(lines)
+
+
 def _save_overlay_plots(
     *,
     records: list[EpisodeEvalRecord],
@@ -821,30 +858,12 @@ def _save_overlay_plots(
         ax.set_aspect("equal", adjustable="box")
         ax.set_xlabel("x (um)")
         ax.set_ylabel("y (um)")
-        match_text = str(row.get("match_method", "none"))
-        iou_text = row.get("pred_iou", np.nan)
-        dice_text = row.get("pred_dice", np.nan)
-        precision_text = row.get("pred_precision", np.nan)
-        recall_text = row.get("pred_recall", np.nan)
-        gene_text = row.get("gene_spearman_r", np.nan)
-        quality = ""
-        if np.isfinite(float(iou_text)) and np.isfinite(float(dice_text)):
-            quality = f"  IoU={float(iou_text):.3f}  Dice={float(dice_text):.3f}"
-        if np.isfinite(float(precision_text)) and np.isfinite(float(recall_text)):
-            quality += f"  P={float(precision_text):.3f}  R={float(recall_text):.3f}"
-        gene_quality = ""
-        if np.isfinite(float(gene_text)):
-            gene_quality = f"  GeneSpearman={float(gene_text):.3f}"
-        ax.set_title(
-            f"cell={row['cell_id']}  reward={row['total_reward']:.2f}  "
-            f"assigned={row['n_assigned_bins']}/{row['n_candidate_bins']}\n"
-            f"GT match={match_text}{quality}{gene_quality}"
-        )
+        ax.set_title(_format_overlay_title(row), fontsize=10.5, pad=10)
         ax.legend(loc="best", fontsize=8, frameon=False)
         fig.tight_layout()
 
         out = overlays_dir / f"overlay_{idx:04d}_{_slug(str(row['cell_id']))}.png"
-        fig.savefig(out, dpi=180)
+        fig.savefig(out, dpi=180, bbox_inches="tight")
         plt.close(fig)
         saved.append(str(out))
 
