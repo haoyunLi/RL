@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 import datetime as dt
 import gzip
@@ -22,33 +21,37 @@ import pandas as pd
 import torch
 import yaml
 
-try:
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    HAS_MATPLOTLIB = True
-except Exception:
-    HAS_MATPLOTLIB = False
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from hd_cell_rl.ppo_checkpoint import load_actor_critic_checkpoint, load_checkpoint_payload
 from hd_cell_rl.ppo_training import (
-    ActorCritic,
     AddStopCellEnv,
     EpisodeDataset,
     PPOTrainingConfig,
+    PLANNER_MODE_BALANCED,
+    PLANNER_MODE_STOP,
     _observation_to_tensors,
+    _observation_with_compact_streak,
+    _observation_without_stop_action,
+    _planner_logit_bias_from_action_features,
     load_ppo_training_config,
 )
 from preprocessing.ppo_format_assignment_eval import (
     _add_numeric_summary,
     annotate_records_with_gene_correlation,
 )
+from preprocessing.ppo_eval_metrics import (
+    build_episode_nuclear_barcode_map,
+    collect_gt_nuclear_candidates,
+    compute_spatial_overlap_metrics,
+    load_episode_build_bins_path,
+    load_gt_bins_for_cells,
+    match_episode_cells_by_nuclear_overlap,
+)
+from preprocessing.ppo_eval_plots import HAS_MATPLOTLIB, save_overlay_plots, save_summary_plots
 
 _LOCAL_TIMEZONE = ZoneInfo("America/Chicago")
 _LOCAL_TIMEZONE_NAME = "America/Chicago"
@@ -196,6 +199,7 @@ def _run_single_episode(
     device: torch.device,
     policy_mode: str,
     rng: np.random.Generator,
+    config: PPOTrainingConfig,
 ) -> EpisodeEvalRecord:
     env = AddStopCellEnv(context)
     obs, _ = env.reset()
@@ -206,20 +210,73 @@ def _run_single_episode(
     terminated = False
     truncated = False
     action_trace: list[dict[str, Any]] = []
+    current_mode = PLANNER_MODE_BALANCED
+    current_compact_streak = 0
+    steps_since_planner = int(config.planner_interval)
 
     while True:
         step_index = int(obs["step_index"])
-        g_t, a_t, m_t = _observation_to_tensors(obs, device=device)
-        with torch.inference_mode():
-            dist, _ = model(g_t, a_t, m_t)
-            probs = dist.probs.squeeze(0).detach().cpu().numpy()
-        if policy_mode == "greedy":
-            action = int(np.argmax(probs))
+        planner_mode_name = None
+        planner_mode_prob = None
+        if bool(config.planner_enabled) and (not action_trace or steps_since_planner >= int(config.planner_interval)):
+            planner_obs = _observation_with_compact_streak(obs, current_compact_streak)
+            global_t = torch.as_tensor(
+                np.asarray(planner_obs["global_features"], dtype=np.float32),
+                device=device,
+            ).unsqueeze(0)
+            with torch.inference_mode():
+                planner_dist = model.planner_distribution(global_t)
+                planner_probs = planner_dist.probs.squeeze(0).detach().cpu().numpy()
+            if policy_mode == "greedy":
+                current_mode = int(np.argmax(planner_probs))
+            else:
+                prob_sum = float(np.sum(planner_probs))
+                if prob_sum <= 0.0 or not np.isfinite(prob_sum):
+                    raise RuntimeError("non-finite planner probabilities during evaluation")
+                current_mode = int(rng.choice(planner_probs.shape[0], p=planner_probs / prob_sum))
+            steps_since_planner = 0
+            planner_mode_name = str(config.planner_modes[current_mode])
+            planner_mode_prob = float(planner_probs[current_mode])
+            current_compact_streak = current_compact_streak + 1 if planner_mode_name == "compact" else 0
+
+        if bool(config.planner_enabled):
+            has_add = bool(np.any(np.asarray(obs["action_mask"], dtype=bool)[1:]))
+            if current_mode == PLANNER_MODE_STOP or not has_add:
+                probs = np.zeros_like(np.asarray(obs["action_mask"], dtype=np.float32), dtype=np.float64)
+                probs[0] = 1.0
+                action = 0
+            else:
+                low_obs = _observation_with_compact_streak(
+                    _observation_without_stop_action(obs),
+                    current_compact_streak,
+                )
+                g_t, a_t, m_t = _observation_to_tensors(low_obs, device=device)
+                mode_t = torch.as_tensor([current_mode], device=device, dtype=torch.long)
+                action_bias = _planner_logit_bias_from_action_features(a_t, mode_t, config)
+                with torch.inference_mode():
+                    dist, _ = model(g_t, a_t, m_t, action_logit_bias=action_bias)
+                    probs = dist.probs.squeeze(0).detach().cpu().numpy()
+                if policy_mode == "greedy":
+                    action = int(np.argmax(probs))
+                else:
+                    prob_sum = float(np.sum(probs))
+                    if prob_sum <= 0.0 or not np.isfinite(prob_sum):
+                        raise RuntimeError("non-finite policy probabilities during evaluation")
+                    action = int(rng.choice(probs.shape[0], p=probs / prob_sum))
+                if action == 0:
+                    raise RuntimeError("planner-controlled evaluation selected STOP despite STOP being masked")
         else:
-            prob_sum = float(np.sum(probs))
-            if prob_sum <= 0.0 or not np.isfinite(prob_sum):
-                raise RuntimeError("non-finite policy probabilities during evaluation")
-            action = int(rng.choice(probs.shape[0], p=probs / prob_sum))
+            g_t, a_t, m_t = _observation_to_tensors(obs, device=device)
+            with torch.inference_mode():
+                dist, _ = model(g_t, a_t, m_t)
+                probs = dist.probs.squeeze(0).detach().cpu().numpy()
+            if policy_mode == "greedy":
+                action = int(np.argmax(probs))
+            else:
+                prob_sum = float(np.sum(probs))
+                if prob_sum <= 0.0 or not np.isfinite(prob_sum):
+                    raise RuntimeError("non-finite policy probabilities during evaluation")
+                action = int(rng.choice(probs.shape[0], p=probs / prob_sum))
 
         obs, reward, term, trunc, info = env.step(action)
         total_reward += float(reward)
@@ -235,11 +292,18 @@ def _run_single_episode(
                 "action_probability": float(probs[action]),
                 "reward": float(reward),
                 "chosen_barcode": chosen_barcode,
+                "planner_mode": planner_mode_name if planner_mode_name is not None else (
+                    str(config.planner_modes[current_mode]) if bool(config.planner_enabled) else None
+                ),
+                "planner_mode_probability": planner_mode_prob,
+                "compact_streak": int(current_compact_streak),
                 "terminated_after_action": bool(term),
                 "truncated_after_action": bool(trunc),
                 "n_assigned_bins_after": int(info.get("n_assigned_bins", 0)),
             }
         )
+        if bool(config.planner_enabled) and action != 0:
+            steps_since_planner += 1
         if term or trunc:
             break
 
@@ -277,154 +341,6 @@ def _now_utc_and_local() -> tuple[dt.datetime, dt.datetime]:
     return now_utc, now_utc.astimezone(_LOCAL_TIMEZONE)
 
 
-def _normalize_cell_id(value: Any) -> str | None:
-    """Normalize mixed int/float/string cell IDs into one stable string form."""
-    if value is None or pd.isna(value):
-        return None
-    if isinstance(value, (np.integer, int)):
-        return str(int(value))
-    if isinstance(value, (np.floating, float)):
-        if not np.isfinite(value):
-            return None
-        if float(value).is_integer():
-            return str(int(value))
-        return str(value)
-    text = str(value).strip()
-    if not text:
-        return None
-    if re.fullmatch(r"[+-]?\d+\.0+", text):
-        return text.split(".", 1)[0]
-    return text
-
-
-def _load_episode_build_bins_path(episodes_index_path: Path) -> Path | None:
-    """Read bins_path from the episode-build resolved config."""
-    cfg_path = episodes_index_path.parent / "config" / "config_resolved.yaml"
-    if not cfg_path.exists():
-        return None
-    with cfg_path.open("r", encoding="utf-8") as handle:
-        raw = yaml.safe_load(handle)
-    if not isinstance(raw, dict):
-        return None
-    inputs = raw.get("inputs")
-    if not isinstance(inputs, dict):
-        return None
-    bins_value = inputs.get("bins_path")
-    if bins_value is None:
-        return None
-    return Path(str(bins_value)).expanduser().resolve()
-
-
-def _build_episode_nuclear_barcode_map(bins_path: Path, target_cell_ids: set[str]) -> dict[str, set[str]]:
-    """Map each evaluated episode cell_id to its nucleus seed barcodes from episode-build bins metadata."""
-    if not bins_path.exists():
-        raise FileNotFoundError(f"episode-build bins metadata not found: {bins_path}")
-
-    df = pd.read_parquet(
-        bins_path,
-        columns=["barcode", "dominant_cell_id", "has_nuclear_annotation"],
-    )
-    df = df.loc[df["has_nuclear_annotation"].fillna(False).astype(bool)].copy()
-    dominant = pd.to_numeric(df["dominant_cell_id"], errors="coerce")
-    keep = dominant.notna()
-    if not np.any(keep.to_numpy(dtype=bool, copy=False)):
-        return {}
-
-    out_df = pd.DataFrame(
-        {
-            "cell_id": dominant.loc[keep].astype(np.int64).astype(str),
-            "barcode": df.loc[keep, "barcode"].astype(str),
-        }
-    )
-    out_df = out_df.loc[out_df["cell_id"].isin(target_cell_ids)].copy()
-    if out_df.empty:
-        return {}
-
-    mapping: dict[str, set[str]] = {}
-    for cell_id, group in out_df.groupby("cell_id", sort=False):
-        mapping[str(cell_id)] = set(group["barcode"].astype(str).tolist())
-    return mapping
-
-
-def _collect_gt_nuclear_candidates(
-    *,
-    gt_nuclear_bins_path: Path,
-    episode_nuclear_barcodes: set[str],
-) -> dict[str, set[str]]:
-    """Collect barcode->GT-cell links for episode nucleus bars."""
-    barcode_to_gt_cells: dict[str, set[str]] = defaultdict(set)
-
-    usecols = ["cell_id", "barcode"]
-    for chunk in pd.read_csv(
-        gt_nuclear_bins_path,
-        usecols=usecols,
-        compression="infer",
-        chunksize=1_000_000,
-    ):
-        chunk = chunk.dropna(subset=["cell_id", "barcode"]).copy()
-        chunk["cell_id"] = chunk["cell_id"].map(_normalize_cell_id)
-        chunk = chunk.loc[chunk["cell_id"].notna()].copy()
-        if chunk.empty:
-            continue
-        chunk["barcode"] = chunk["barcode"].astype(str)
-
-        overlap = chunk.loc[chunk["barcode"].isin(episode_nuclear_barcodes), ["barcode", "cell_id"]]
-        for barcode, group in overlap.groupby("barcode", sort=False):
-            barcode_to_gt_cells[str(barcode)].update(group["cell_id"].astype(str).tolist())
-
-    return dict(barcode_to_gt_cells)
-
-
-def _load_gt_bins_for_cells(
-    *,
-    csv_path: Path,
-    matched_cell_ids: set[str],
-) -> tuple[dict[str, set[str]], dict[str, np.ndarray]]:
-    """Load GT bin barcode sets and XY arrays only for matched GT cells."""
-    if not matched_cell_ids:
-        return {}, {}
-
-    barcode_map: dict[str, list[str]] = defaultdict(list)
-    xy_x: dict[str, list[float]] = defaultdict(list)
-    xy_y: dict[str, list[float]] = defaultdict(list)
-    usecols = ["cell_id", "barcode", "x_um", "y_um"]
-    for chunk in pd.read_csv(
-        csv_path,
-        usecols=usecols,
-        compression="infer",
-        chunksize=1_000_000,
-    ):
-        chunk = chunk.dropna(subset=["cell_id", "barcode", "x_um", "y_um"]).copy()
-        chunk["cell_id"] = chunk["cell_id"].map(_normalize_cell_id)
-        chunk = chunk.loc[chunk["cell_id"].isin(matched_cell_ids)].copy()
-        if chunk.empty:
-            continue
-
-        chunk["barcode"] = chunk["barcode"].astype(str)
-        chunk["x_um"] = pd.to_numeric(chunk["x_um"], errors="coerce")
-        chunk["y_um"] = pd.to_numeric(chunk["y_um"], errors="coerce")
-        chunk = chunk.dropna(subset=["x_um", "y_um"])
-        if chunk.empty:
-            continue
-
-        for cell_id, group in chunk.groupby("cell_id", sort=False):
-            barcode_map[str(cell_id)].extend(group["barcode"].astype(str).tolist())
-            xy_x[str(cell_id)].extend(group["x_um"].astype(float).tolist())
-            xy_y[str(cell_id)].extend(group["y_um"].astype(float).tolist())
-
-    barcode_sets = {cell_id: set(values) for cell_id, values in barcode_map.items()}
-    xy_map = {
-        cell_id: np.column_stack(
-            (
-                np.asarray(xy_x[cell_id], dtype=np.float32),
-                np.asarray(xy_y[cell_id], dtype=np.float32),
-            )
-        )
-        for cell_id in barcode_map
-    }
-    return barcode_sets, xy_map
-
-
 def _annotate_records_with_ground_truth(
     *,
     records: list[EpisodeEvalRecord],
@@ -438,62 +354,46 @@ def _annotate_records_with_ground_truth(
     if not records:
         return records
 
-    bins_path = _load_episode_build_bins_path(episodes_index_path)
+    bins_path = load_episode_build_bins_path(episodes_index_path)
     if bins_path is None:
         raise FileNotFoundError(
             f"could not resolve episode-build bins_path from {episodes_index_path.parent / 'config' / 'config_resolved.yaml'}"
-        )
+    )
 
     episode_cell_ids = {str(rec.metrics["cell_id"]) for rec in records}
-    episode_nuclear_by_cell = _build_episode_nuclear_barcode_map(bins_path=bins_path, target_cell_ids=episode_cell_ids)
+    episode_nuclear_by_cell = build_episode_nuclear_barcode_map(bins_path=bins_path, target_cell_ids=episode_cell_ids)
     episode_nuclear_union = set().union(*episode_nuclear_by_cell.values()) if episode_nuclear_by_cell else set()
 
-    barcode_to_gt_cells = _collect_gt_nuclear_candidates(
+    barcode_to_gt_cells = collect_gt_nuclear_candidates(
         gt_nuclear_bins_path=gt_nuclear_bins_path,
         episode_nuclear_barcodes=episode_nuclear_union,
     )
 
-    matched_gt_ids: set[str] = set()
+    matched_raw, matched_gt_ids = match_episode_cells_by_nuclear_overlap(
+        episode_nuclear_by_cell=episode_nuclear_by_cell,
+        barcode_to_target_cells=barcode_to_gt_cells,
+        min_overlap_frac=min_overlap_frac,
+        min_overlap_bins=min_overlap_bins,
+        match_method="nuclear_overlap",
+    )
     provisional: dict[str, dict[str, Any]] = {}
     for rec in records:
         cell_id = str(rec.metrics["cell_id"])
         ep_nuclear = episode_nuclear_by_cell.get(cell_id, set())
-
-        match_method = "unmatched"
-        matched_gt_cell_id: str | None = None
-        overlap_count = 0
-        overlap_frac_episode = np.nan
-
-        if ep_nuclear:
-            counts: Counter[str] = Counter()
-            for barcode in ep_nuclear:
-                for gt_cell_id in barcode_to_gt_cells.get(barcode, ()):
-                    counts[str(gt_cell_id)] += 1
-            if counts:
-                best_gt_cell_id, best_count = max(counts.items(), key=lambda kv: (kv[1], kv[0]))
-                best_frac = float(best_count / len(ep_nuclear))
-                if int(best_count) >= int(min_overlap_bins) and best_frac >= float(min_overlap_frac):
-                    matched_gt_cell_id = str(best_gt_cell_id)
-                    match_method = "nuclear_overlap"
-                    overlap_count = int(best_count)
-                    overlap_frac_episode = best_frac
-
-        if matched_gt_cell_id is not None:
-            matched_gt_ids.add(matched_gt_cell_id)
-
+        raw = matched_raw.get(cell_id, {})
         provisional[cell_id] = {
-            "matched_gt_cell_id": matched_gt_cell_id,
-            "match_method": match_method,
+            "matched_gt_cell_id": raw.get("matched_cell_id"),
+            "match_method": raw.get("match_method", "unmatched"),
             "episode_nuclear_bin_count": int(len(ep_nuclear)),
-            "nuclear_overlap_bins": int(overlap_count),
-            "nuclear_overlap_frac_episode": float(overlap_frac_episode),
+            "nuclear_overlap_bins": int(raw.get("nuclear_overlap_bins", 0)),
+            "nuclear_overlap_frac_episode": float(raw.get("nuclear_overlap_frac_episode", np.nan)),
         }
 
-    gt_nuclear_by_cell, gt_nuclear_xy_by_cell = _load_gt_bins_for_cells(
+    gt_nuclear_by_cell, gt_nuclear_xy_by_cell = load_gt_bins_for_cells(
         csv_path=gt_nuclear_bins_path,
         matched_cell_ids=matched_gt_ids,
     )
-    gt_cell_by_cell, gt_cell_xy_by_cell = _load_gt_bins_for_cells(
+    gt_cell_by_cell, gt_cell_xy_by_cell = load_gt_bins_for_cells(
         csv_path=gt_cell_bins_path,
         matched_cell_ids=matched_gt_ids,
     )
@@ -509,11 +409,7 @@ def _annotate_records_with_ground_truth(
         gt_nuclear_xy = None
         gt_cell_xy = None
         overlap_frac_gt = np.nan
-        pred_iou = np.nan
-        pred_dice = np.nan
-        pred_precision = np.nan
-        pred_recall = np.nan
-        pred_intersection_bins = 0
+        overlap_metrics = None
 
         if matched_gt_cell_id is not None:
             gt_nuclear = gt_nuclear_by_cell.get(matched_gt_cell_id, set())
@@ -532,32 +428,19 @@ def _annotate_records_with_ground_truth(
                 if i < assigned_mask.shape[0] and assigned_mask[i]
             }
             if gt_cell:
-                pred_intersection_bins = int(len(pred_bars & gt_cell))
-                union = int(len(pred_bars | gt_cell))
-                if union > 0:
-                    pred_iou = float(pred_intersection_bins / union)
-                denom = int(len(pred_bars) + len(gt_cell))
-                if denom > 0:
-                    pred_dice = float((2.0 * pred_intersection_bins) / denom)
-                pred_precision = float(pred_intersection_bins / len(pred_bars)) if len(pred_bars) > 0 else 0.0
-                pred_recall = float(pred_intersection_bins / len(gt_cell))
-        pred_f1 = (
-            float((2 * pred_precision * pred_recall) / (pred_precision + pred_recall))
-            if np.isfinite(pred_precision) and np.isfinite(pred_recall) and (pred_precision + pred_recall) > 0
-            else np.nan
-        )
+                overlap_metrics = compute_spatial_overlap_metrics(pred_bars, gt_cell)
 
         meta.update(
             {
                 "gt_nuclear_bin_count": int(len(gt_nuclear)),
                 "gt_cell_bin_count": int(len(gt_cell)),
                 "nuclear_overlap_frac_gt": float(overlap_frac_gt),
-                "pred_gt_intersection_bins": int(pred_intersection_bins),
-                "pred_iou": float(pred_iou),
-                "pred_dice": float(pred_dice),
-                "pred_precision": float(pred_precision),
-                "pred_recall": float(pred_recall),
-                "pred_f1": float(pred_f1),
+                "pred_gt_intersection_bins": 0 if overlap_metrics is None else int(overlap_metrics["intersection"]),
+                "pred_iou": np.nan if overlap_metrics is None else float(overlap_metrics["iou"]),
+                "pred_dice": np.nan if overlap_metrics is None else float(overlap_metrics["dice"]),
+                "pred_precision": np.nan if overlap_metrics is None else float(overlap_metrics["precision"]),
+                "pred_recall": np.nan if overlap_metrics is None else float(overlap_metrics["recall"]),
+                "pred_f1": np.nan if overlap_metrics is None else float(overlap_metrics["f1"]),
             }
         )
 
@@ -570,304 +453,6 @@ def _annotate_records_with_ground_truth(
             )
         )
     return updated
-
-
-def _save_summary_plots(df: pd.DataFrame, run_dir: Path) -> list[str]:
-    """Write aggregate evaluation plots."""
-    if not HAS_MATPLOTLIB:
-        return []
-
-    plots_dir = run_dir / "plots"
-    plots_dir.mkdir(parents=True, exist_ok=True)
-    saved: list[str] = []
-
-    fig, ax = plt.subplots(figsize=(7.5, 5.0))
-    ax.hist(df["total_reward"].to_numpy(dtype=np.float64), bins=40, color="#2A9D8F", alpha=0.9)
-    ax.set_title("Episode Total Reward Distribution")
-    ax.set_xlabel("Total Reward")
-    ax.set_ylabel("Episode Count")
-    fig.tight_layout()
-    p = plots_dir / "reward_hist.png"
-    fig.savefig(p, dpi=180)
-    plt.close(fig)
-    saved.append(str(p))
-
-    fig, ax = plt.subplots(figsize=(7.5, 5.0))
-    ax.hist(df["n_assigned_bins"].to_numpy(dtype=np.float64), bins=40, color="#E76F51", alpha=0.9)
-    ax.set_title("Assigned Bins Distribution")
-    ax.set_xlabel("Assigned Bins")
-    ax.set_ylabel("Episode Count")
-    fig.tight_layout()
-    p = plots_dir / "assigned_bins_hist.png"
-    fig.savefig(p, dpi=180)
-    plt.close(fig)
-    saved.append(str(p))
-
-    fig, ax = plt.subplots(figsize=(7.5, 5.0))
-    ax.scatter(
-        df["n_assigned_bins"].to_numpy(dtype=np.float64),
-        df["total_reward"].to_numpy(dtype=np.float64),
-        s=12,
-        alpha=0.5,
-        color="#264653",
-        linewidths=0.0,
-    )
-    ax.set_title("Reward vs Assigned Bins")
-    ax.set_xlabel("Assigned Bins")
-    ax.set_ylabel("Total Reward")
-    fig.tight_layout()
-    p = plots_dir / "reward_vs_assigned_bins.png"
-    fig.savefig(p, dpi=180)
-    plt.close(fig)
-    saved.append(str(p))
-
-    if "pred_iou" in df.columns:
-        iou = df["pred_iou"].to_numpy(dtype=np.float64)
-        iou = iou[np.isfinite(iou)]
-        if iou.size > 0:
-            fig, ax = plt.subplots(figsize=(7.5, 5.0))
-            ax.hist(iou, bins=30, color="#457B9D", alpha=0.9)
-            ax.set_title("Predicted vs GT IoU Distribution")
-            ax.set_xlabel("IoU")
-            ax.set_ylabel("Episode Count")
-            fig.tight_layout()
-            p = plots_dir / "pred_gt_iou_hist.png"
-            fig.savefig(p, dpi=180)
-            plt.close(fig)
-            saved.append(str(p))
-
-            fig, ax = plt.subplots(figsize=(7.5, 5.0))
-            iou_sorted = np.sort(iou)
-            cdf_y = np.arange(1, iou_sorted.size + 1, dtype=np.float64) / float(iou_sorted.size)
-            ax.plot(iou_sorted, cdf_y, color="#2A6F97", linewidth=2.0)
-            ax.set_title("Predicted vs GT IoU CDF")
-            ax.set_xlabel("IoU")
-            ax.set_ylabel("Cumulative Fraction")
-            ax.set_xlim(0.0, 1.0)
-            ax.set_ylim(0.0, 1.0)
-            ax.grid(True, alpha=0.25, linewidth=0.6)
-            fig.tight_layout()
-            p = plots_dir / "pred_gt_iou_cdf.png"
-            fig.savefig(p, dpi=180)
-            plt.close(fig)
-            saved.append(str(p))
-
-    if "pred_dice" in df.columns:
-        dice = df["pred_dice"].to_numpy(dtype=np.float64)
-        dice = dice[np.isfinite(dice)]
-        if dice.size > 0:
-            fig, ax = plt.subplots(figsize=(7.5, 5.0))
-            ax.hist(dice, bins=30, color="#1D3557", alpha=0.9)
-            ax.set_title("Predicted vs GT Dice Distribution")
-            ax.set_xlabel("Dice")
-            ax.set_ylabel("Episode Count")
-            fig.tight_layout()
-            p = plots_dir / "pred_gt_dice_hist.png"
-            fig.savefig(p, dpi=180)
-            plt.close(fig)
-            saved.append(str(p))
-
-    return saved
-
-
-def _choose_overlay_indices(df: pd.DataFrame, n_pick: int, selection: str, seed: int) -> list[int]:
-    if n_pick <= 0 or len(df) == 0:
-        return []
-    n_pick = min(n_pick, len(df))
-    if selection == "first":
-        return list(range(n_pick))
-    if selection == "top_reward":
-        order = np.argsort(-df["total_reward"].to_numpy(dtype=np.float64))
-        return [int(i) for i in order[:n_pick]]
-    rng = np.random.default_rng(seed)
-    choices = rng.choice(len(df), size=n_pick, replace=False)
-    return [int(i) for i in np.asarray(choices, dtype=np.int64)]
-
-
-def _estimate_grid_step(coords: np.ndarray) -> float:
-    """Estimate bin-center spacing from one axis of GT bin coordinates."""
-    vals = np.unique(np.asarray(coords, dtype=np.float64))
-    if vals.size <= 1:
-        return 2.0
-    diffs = np.diff(np.sort(vals))
-    diffs = diffs[np.isfinite(diffs) & (diffs > 1.0e-6)]
-    if diffs.size == 0:
-        return 2.0
-    return float(np.median(diffs))
-
-
-def _build_gt_contour_grid(xy: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-    """Convert GT occupied bins into a padded binary grid for connected contour drawing."""
-    pts = np.asarray(xy, dtype=np.float64)
-    if pts.ndim != 2 or pts.shape[1] != 2 or pts.shape[0] == 0:
-        return None
-
-    step_x = _estimate_grid_step(pts[:, 0])
-    step_y = _estimate_grid_step(pts[:, 1])
-    x0 = float(np.min(pts[:, 0]))
-    y0 = float(np.min(pts[:, 1]))
-
-    ix = np.rint((pts[:, 0] - x0) / step_x).astype(np.int64)
-    iy = np.rint((pts[:, 1] - y0) / step_y).astype(np.int64)
-    if ix.size == 0 or iy.size == 0:
-        return None
-
-    min_ix = int(ix.min())
-    max_ix = int(ix.max())
-    min_iy = int(iy.min())
-    max_iy = int(iy.max())
-    width = max_ix - min_ix + 1
-    height = max_iy - min_iy + 1
-    if width <= 0 or height <= 0:
-        return None
-
-    grid = np.zeros((height + 2, width + 2), dtype=np.uint8)
-    gx = (ix - min_ix + 1).astype(np.int64, copy=False)
-    gy = (iy - min_iy + 1).astype(np.int64, copy=False)
-    grid[gy, gx] = 1
-
-    x_coords = x0 + ((np.arange(width + 2, dtype=np.float64) + min_ix - 1.0) * step_x)
-    y_coords = y0 + ((np.arange(height + 2, dtype=np.float64) + min_iy - 1.0) * step_y)
-    return x_coords, y_coords, grid
-
-
-def _finite_float_or_none(value: Any) -> float | None:
-    try:
-        val = float(value)
-    except (TypeError, ValueError):
-        return None
-    return val if np.isfinite(val) else None
-
-
-def _format_overlay_title(row: dict[str, Any]) -> str:
-    lines = [
-        f"cell={row['cell_id']}  reward={row['total_reward']:.2f}  "
-        f"assigned={row['n_assigned_bins']}/{row['n_candidate_bins']}",
-        f"GT match={row.get('match_method', 'none')}",
-    ]
-
-    iou = _finite_float_or_none(row.get("pred_iou", np.nan))
-    dice = _finite_float_or_none(row.get("pred_dice", np.nan))
-    precision = _finite_float_or_none(row.get("pred_precision", np.nan))
-    recall = _finite_float_or_none(row.get("pred_recall", np.nan))
-    metric_parts: list[str] = []
-    if iou is not None:
-        metric_parts.append(f"IoU={iou:.3f}")
-    if dice is not None:
-        metric_parts.append(f"Dice={dice:.3f}")
-    if precision is not None:
-        metric_parts.append(f"P={precision:.3f}")
-    if recall is not None:
-        metric_parts.append(f"R={recall:.3f}")
-    if metric_parts:
-        lines.append("  ".join(metric_parts))
-
-    gene = _finite_float_or_none(row.get("gene_spearman_r", np.nan))
-    if gene is not None:
-        lines.append(f"Gene Spearman={gene:.3f}")
-    return "\n".join(lines)
-
-
-def _save_overlay_plots(
-    *,
-    records: list[EpisodeEvalRecord],
-    df: pd.DataFrame,
-    run_dir: Path,
-    max_cells: int,
-    selection: str,
-    seed: int,
-) -> list[str]:
-    """Write per-cell spatial overlay plots."""
-    if not HAS_MATPLOTLIB or max_cells <= 0 or not records:
-        return []
-
-    overlays_dir = run_dir / "overlays"
-    overlays_dir.mkdir(parents=True, exist_ok=True)
-
-    indices = _choose_overlay_indices(df=df, n_pick=max_cells, selection=selection, seed=seed)
-    saved: list[str] = []
-    for idx in indices:
-        rec = records[idx]
-        row = rec.metrics
-        xy = np.asarray(rec.candidate_bin_xy_um, dtype=np.float32)
-        if xy.ndim != 2 or xy.shape[1] != 2 or xy.shape[0] == 0:
-            continue
-        assigned = np.asarray(rec.final_membership_mask, dtype=np.uint8) == 1
-        if assigned.shape[0] != xy.shape[0]:
-            continue
-
-        fig, ax = plt.subplots(figsize=(6.2, 6.2))
-        ax.scatter(
-            xy[:, 0],
-            xy[:, 1],
-            s=3,
-            c="#D0D4DB",
-            alpha=0.22,
-            linewidths=0.0,
-            zorder=1,
-            label="candidate bins",
-        )
-        gt_cell_xy = None if rec.gt_cell_xy_um is None else np.asarray(rec.gt_cell_xy_um, dtype=np.float32)
-        if gt_cell_xy is not None and gt_cell_xy.ndim == 2 and gt_cell_xy.shape[1] == 2 and gt_cell_xy.shape[0] > 0:
-            contour_grid = _build_gt_contour_grid(gt_cell_xy)
-            if contour_grid is not None:
-                x_coords, y_coords, grid = contour_grid
-                ax.contour(
-                    x_coords,
-                    y_coords,
-                    grid,
-                    levels=[0.5],
-                    colors=["#1D3557"],
-                    linewidths=3.0,
-                    alpha=1.0,
-                    zorder=4,
-                )
-                ax.plot(
-                    [],
-                    [],
-                    color="#1D3557",
-                    linewidth=3.0,
-                    alpha=1.0,
-                    label="GT cell outline",
-                )
-        if np.any(assigned):
-            ax.scatter(
-                xy[assigned, 0],
-                xy[assigned, 1],
-                s=8,
-                c="#E63946",
-                alpha=0.95,
-                linewidths=0.0,
-                zorder=3,
-                label="assigned bins",
-            )
-
-        center = np.asarray(rec.nucleus_center_xy_um, dtype=np.float32)
-        if center.shape == (2,):
-            ax.scatter(
-                [float(center[0])],
-                [float(center[1])],
-                s=90,
-                marker="x",
-                c="#1D3557",
-                linewidths=2.0,
-                zorder=5,
-                label="nucleus center",
-            )
-
-        ax.set_aspect("equal", adjustable="box")
-        ax.set_xlabel("x (um)")
-        ax.set_ylabel("y (um)")
-        ax.set_title(_format_overlay_title(row), fontsize=10.5, pad=10)
-        ax.legend(loc="best", fontsize=8, frameon=False)
-        fig.tight_layout()
-
-        out = overlays_dir / f"overlay_{idx:04d}_{_slug(str(row['cell_id']))}.png"
-        fig.savefig(out, dpi=180, bbox_inches="tight")
-        plt.close(fig)
-        saved.append(str(out))
-
-    return saved
 
 
 def _write_step_traces(
@@ -923,11 +508,7 @@ def main() -> None:
     if not ckpt_path.exists():
         raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
 
-    payload = torch.load(ckpt_path, map_location="cpu")
-    if not isinstance(payload, dict):
-        raise ValueError("invalid checkpoint payload")
-    if "model_state_dict" not in payload:
-        raise ValueError("checkpoint missing 'model_state_dict'")
+    payload = load_checkpoint_payload(ckpt_path)
 
     if args.config is not None:
         config = load_ppo_training_config(args.config)
@@ -948,13 +529,7 @@ def main() -> None:
     run_dir = out_root / f"{args.run_name}_{ts}"
     run_dir.mkdir(parents=False, exist_ok=False)
 
-    model = ActorCritic(
-        global_dim=AddStopCellEnv.GLOBAL_FEATURE_DIM,
-        action_dim=AddStopCellEnv.ACTION_FEATURE_DIM,
-        hidden_dim=int(config.hidden_dim),
-    ).to(device)
-    model.load_state_dict(payload["model_state_dict"])
-    model.eval()
+    model, payload = load_actor_critic_checkpoint(ckpt_path, config, device=device, payload=payload)
 
     dataset = EpisodeDataset(config=config, rng=rng)
     try:
@@ -979,6 +554,7 @@ def main() -> None:
                     device=device,
                     policy_mode=str(args.policy_mode),
                     rng=rng,
+                    config=config,
                 )
             )
             if i % 10 == 0 or i == n_eval:
@@ -1022,14 +598,15 @@ def main() -> None:
     df = pd.DataFrame(results)
     df.to_csv(run_dir / "per_episode.csv", index=False)
 
-    summary_plots = _save_summary_plots(df=df, run_dir=run_dir)
-    overlay_plots = _save_overlay_plots(
+    summary_plots = save_summary_plots(df=df, run_dir=run_dir, method_label="PPO")
+    overlay_plots = save_overlay_plots(
         records=episode_records,
         df=df,
         run_dir=run_dir,
         max_cells=int(args.overlay_max_cells),
         selection=str(args.overlay_selection),
         seed=int(args.seed),
+        method_label="PPO",
     )
 
     summary = {
@@ -1062,6 +639,24 @@ def main() -> None:
         "step_traces_dir": str(run_dir / "step_traces"),
         "n_step_trace_files": int(len(episode_records)),
     }
+    if bool(config.planner_enabled):
+        planner_modes = [
+            str(step.get("planner_mode"))
+            for rec in episode_records
+            for step in rec.action_trace
+            if step.get("planner_mode") is not None
+        ]
+        compact_streaks = [
+            int(step.get("compact_streak", 0))
+            for rec in episode_records
+            for step in rec.action_trace
+            if step.get("planner_mode") is not None
+        ]
+        summary["planner_mode_counts"] = {
+            str(k): int(v) for k, v in pd.Series(planner_modes, dtype="string").value_counts().items()
+        }
+        summary["compact_streak_mean"] = float(np.mean(compact_streaks)) if compact_streaks else 0.0
+        summary["compact_streak_max"] = int(max(compact_streaks)) if compact_streaks else 0
     if "matched_gt_cell_id" in df.columns:
         matched = df["matched_gt_cell_id"].astype("string").notna()
         summary["matched_gt_fraction"] = float(matched.mean())

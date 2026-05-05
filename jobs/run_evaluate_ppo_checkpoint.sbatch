@@ -30,7 +30,7 @@ export TORCH_NUM_INTEROP_THREADS=1
 unset KMP_LOGFILE || true
 unset LOGFILE || true
 
-CHECKPOINT_PATH="${CHECKPOINT_PATH:-runs/human_colorectal_full_grpo_20260428T195942Z/checkpoints/best_model.pt}"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-runs/human_colorectal_full_grpo_20260504T214752Z/checkpoints/best_model.pt}"
 PPO_CONFIG="${PPO_CONFIG:-}"
 EPISODES_INDEX_PATH="${EPISODES_INDEX_PATH:-}"
 MAX_EPISODES="${MAX_EPISODES:-300}"

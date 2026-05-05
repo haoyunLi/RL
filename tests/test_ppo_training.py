@@ -7,19 +7,34 @@ import unittest
 
 import numpy as np
 import pandas as pd
+import torch
 import yaml
 
+from hd_cell_rl.ppo_feature_schema import (
+    ACTION_FEATURE_DIM,
+    A_CANDIDATE_COMPACTNESS_GAIN,
+    A_CANDIDATE_NEIGHBOR_SUPPORT,
+    A_IS_STOP_ACTION,
+    GLOBAL_FEATURE_DIM,
+)
 from hd_cell_rl.ppo_training import (
+    ActorCritic,
     ConfigError,
     AddStopCellEnv,
     EpisodeStep,
     EpisodeTrajectory,
+    PlannerStep,
+    PLANNER_MODE_COMPACT,
     _build_policy_observation_from_state,
+    _build_planner_rollout_buffer,
     _build_rollout_buffer,
     _compute_full_grpo_episode_scores,
     _compute_group_relative_episode_advantages,
     _compute_state_feature_bundle,
-    _full_grpo_size_score,
+    _full_grpo_frontier_quality,
+    _full_grpo_key_node_score,
+    _full_grpo_stop_score,
+    _planner_logit_bias_from_action_features,
     _posterior_confidence_delta_per_bin,
     compute_discounted_returns,
     compute_gae_returns_and_advantages,
@@ -130,7 +145,7 @@ class PPOTrainingTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 load_ppo_training_config(config_path)
 
-    def test_full_grpo_size_score_penalizes_targeted_size_errors(self) -> None:
+    def test_full_grpo_frontier_quality_is_evidence_gated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = self._write_minimal_config(
                 Path(tmp_dir),
@@ -140,37 +155,55 @@ class PPOTrainingTests(unittest.TestCase):
             )
             config = load_ppo_training_config(config_path)
 
-        small_over = _full_grpo_size_score(
-            grow_ratio=4.0,
-            lower=1.4,
-            upper=2.4,
-            bucket="small",
-            config=config,
-        )
-        medium_over = _full_grpo_size_score(
-            grow_ratio=4.0,
-            lower=1.6,
-            upper=2.8,
-            bucket="medium",
-            config=config,
-        )
-        large_under = _full_grpo_size_score(
-            grow_ratio=0.5,
-            lower=1.8,
-            upper=3.4,
-            bucket="large",
-            config=config,
-        )
-        medium_under = _full_grpo_size_score(
-            grow_ratio=0.5,
-            lower=1.6,
-            upper=2.8,
-            bucket="medium",
-            config=config,
-        )
+        low = _full_grpo_frontier_quality(topk_mean=-1.0, has_frontier=True, config=config)
+        high = _full_grpo_frontier_quality(topk_mean=1.0, has_frontier=True, config=config)
+        none = _full_grpo_frontier_quality(topk_mean=1.0, has_frontier=False, config=config)
 
-        self.assertLess(small_over, medium_over)
-        self.assertLess(large_under, medium_under)
+        self.assertLess(low, 0.5)
+        self.assertGreater(high, 0.5)
+        self.assertEqual(none, 0.0)
+
+    def test_full_grpo_stop_score_prefers_stop_when_frontier_quality_is_low(self) -> None:
+        stop_low = _full_grpo_stop_score(stopped=True, frontier_quality=0.1, overgrowth_risk=0.4)
+        keep_low = _full_grpo_stop_score(stopped=False, frontier_quality=0.1, overgrowth_risk=0.4)
+        stop_high = _full_grpo_stop_score(stopped=True, frontier_quality=0.9, overgrowth_risk=0.0)
+        keep_high = _full_grpo_stop_score(stopped=False, frontier_quality=0.9, overgrowth_risk=0.0)
+
+        self.assertGreater(stop_low, keep_low)
+        self.assertLess(stop_high, keep_high)
+
+    def test_full_grpo_key_node_score_penalizes_repeated_compact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            config_path = self._write_minimal_config(
+                root,
+                batch_cells=2,
+                group_relative_enabled=True,
+                training_mode="full_grpo",
+                planner_enabled=True,
+            )
+            config = load_ppo_training_config(config_path)
+            ctx = self._minimal_episode_context(config)
+            packed = np.packbits(np.asarray([1, 0], dtype=np.uint8))
+            first = PlannerStep(
+                packed_membership_mask=packed,
+                step_index=0,
+                mode=PLANNER_MODE_COMPACT,
+                old_log_prob=-0.7,
+                compact_streak=0,
+            )
+            repeated = PlannerStep(
+                packed_membership_mask=packed,
+                step_index=0,
+                mode=PLANNER_MODE_COMPACT,
+                old_log_prob=-0.7,
+                compact_streak=8,
+            )
+
+        self.assertGreater(
+            _full_grpo_key_node_score(ctx=ctx, planner_step=first, config=config),
+            _full_grpo_key_node_score(ctx=ctx, planner_step=repeated, config=config),
+        )
 
     def test_full_grpo_scores_use_size_aware_terminal_objective(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -226,10 +259,79 @@ class PPOTrainingTests(unittest.TestCase):
 
         self.assertEqual(obs["global_features"].shape, (AddStopCellEnv.GLOBAL_FEATURE_DIM,))
         self.assertEqual(obs["action_features"].shape, (3, AddStopCellEnv.ACTION_FEATURE_DIM))
-        self.assertEqual(AddStopCellEnv.GLOBAL_FEATURE_DIM, 11)
-        self.assertEqual(AddStopCellEnv.ACTION_FEATURE_DIM, 13)
+        self.assertEqual(AddStopCellEnv.GLOBAL_FEATURE_DIM, GLOBAL_FEATURE_DIM)
+        self.assertEqual(AddStopCellEnv.ACTION_FEATURE_DIM, ACTION_FEATURE_DIM)
         self.assertTrue(np.isfinite(obs["global_features"]).all())
         self.assertTrue(np.isfinite(obs["action_features"]).all())
+
+    def test_planner_config_defaults_disabled_and_preserves_policy_dims(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = load_ppo_training_config(
+                self._write_minimal_config(Path(tmp_dir), batch_cells=2, group_relative_enabled=True)
+            )
+
+        self.assertFalse(config.planner_enabled)
+        self.assertEqual(config.planner_modes, ("stop", "compact", "balanced", "explore"))
+        model = ActorCritic(
+            global_dim=AddStopCellEnv.GLOBAL_FEATURE_DIM,
+            action_dim=AddStopCellEnv.ACTION_FEATURE_DIM,
+            hidden_dim=8,
+            planner_enabled=False,
+        )
+        self.assertFalse(hasattr(model, "planner_head"))
+        self.assertEqual(AddStopCellEnv.GLOBAL_FEATURE_DIM, GLOBAL_FEATURE_DIM)
+        self.assertEqual(AddStopCellEnv.ACTION_FEATURE_DIM, ACTION_FEATURE_DIM)
+
+    def test_planner_logit_bias_is_soft_add_bias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = load_ppo_training_config(
+                self._write_minimal_config(
+                    Path(tmp_dir),
+                    batch_cells=2,
+                    group_relative_enabled=True,
+                    training_mode="full_grpo",
+                    planner_enabled=True,
+                )
+            )
+
+        action_features = torch.zeros((1, 3, AddStopCellEnv.ACTION_FEATURE_DIM), dtype=torch.float32)
+        action_features[0, 0, A_IS_STOP_ACTION] = 1.0
+        action_features[0, 1, A_CANDIDATE_COMPACTNESS_GAIN] = 0.1
+        action_features[0, 2, A_CANDIDATE_COMPACTNESS_GAIN] = 0.1
+        action_features[0, 1, A_CANDIDATE_NEIGHBOR_SUPPORT] = 0.0
+        action_features[0, 2, A_CANDIDATE_NEIGHBOR_SUPPORT] = 1.0
+        bias = _planner_logit_bias_from_action_features(
+            action_features,
+            torch.as_tensor([PLANNER_MODE_COMPACT], dtype=torch.long),
+            config,
+        )
+
+        self.assertIsNotNone(bias)
+        self.assertEqual(tuple(bias.shape), (1, 3))
+        self.assertEqual(float(bias[0, 0]), 0.0)
+        self.assertGreater(float(bias[0, 2]), float(bias[0, 1]))
+
+    def test_planner_rollout_buffer_broadcasts_episode_bonus(self) -> None:
+        planner_step = PlannerStep(
+            packed_membership_mask=np.zeros((1,), dtype=np.uint8),
+            step_index=0,
+            mode=PLANNER_MODE_COMPACT,
+            old_log_prob=-0.7,
+        )
+        trajectories = [
+            EpisodeTrajectory(episode_slot=0, steps=tuple(), total_reward=1.0, planner_steps=(planner_step,)),
+            EpisodeTrajectory(episode_slot=1, steps=tuple(), total_reward=2.0, planner_steps=(planner_step,)),
+        ]
+
+        transitions = _build_planner_rollout_buffer(
+            trajectories=trajectories,
+            episode_advantage_bonus=np.asarray([-1.0, 1.0], dtype=np.float64),
+        )
+
+        self.assertEqual(len(transitions), 2)
+        self.assertEqual(transitions[0].mode, PLANNER_MODE_COMPACT)
+        self.assertEqual(transitions[0].advantage, -1.0)
+        self.assertEqual(transitions[1].advantage, 1.0)
 
     def test_radial_alignment_is_zero_without_centroid_drift(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -342,6 +444,22 @@ class PPOTrainingTests(unittest.TestCase):
             self.assertTrue((result.run_dir / "summary.json").exists())
             self.assertTrue((result.run_dir / "checkpoints" / "final_model.pt").exists())
 
+    def test_run_ppo_training_smoke_with_full_grpo_planner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            config_path = self._write_minimal_config(
+                root,
+                batch_cells=2,
+                group_relative_enabled=True,
+                training_mode="full_grpo",
+                planner_enabled=True,
+            )
+
+            result = run_ppo_training_from_config(config_path)
+
+            self.assertTrue((result.run_dir / "summary.json").exists())
+            self.assertTrue((result.run_dir / "checkpoints" / "final_model.pt").exists())
+
     def test_run_ppo_training_smoke_with_group_relative(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -366,6 +484,7 @@ class PPOTrainingTests(unittest.TestCase):
         batch_cells: int,
         group_relative_enabled: bool,
         training_mode: str = "ppo",
+        planner_enabled: bool = False,
     ) -> Path:
         episodes_dir = root / "episodes"
         episodes_dir.mkdir(parents=True, exist_ok=True)
@@ -462,20 +581,24 @@ class PPOTrainingTests(unittest.TestCase):
                 "norm_epsilon": 1.0e-6,
                 "score": "episode_total_reward",
             },
+            "planner": {
+                "enabled": planner_enabled,
+                "interval": 1,
+                "modes": ["stop", "compact", "balanced", "explore"],
+                "cot_weight": 0.4,
+                "entropy_coef": 0.02,
+                "logit_bias": {},
+            },
             "full_grpo": {
                 "reward_weight": 1.0,
-                "size_weight": 0.8,
-                "stop_weight": 0.4,
-                "compact_weight": 0.2,
-                "small_over_weight": 1.2,
-                "large_under_weight": 1.2,
-                "small_seed_max": 8,
-                "large_seed_min": 17,
-                "targets": {
-                    "small": [1.4, 2.4],
-                    "medium": [1.6, 2.8],
-                    "large": [1.8, 3.4],
-                },
+                "evidence_growth_weight": 0.7,
+                "stop_weight": 0.5,
+                "overgrowth_weight": 0.8,
+                "compact_weight": 0.25,
+                "compact_streak_weight": 0.25,
+                "explore_weight": 0.4,
+                "tau_frontier": 0.0,
+                "frontier_temp": 0.2,
             },
             "reward": {
                 "epsilon": 1.0e-8,

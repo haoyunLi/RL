@@ -4,17 +4,13 @@ import datetime as dt
 import h5py
 import json
 import logging
-import re
 import sys
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import yaml
@@ -34,11 +30,132 @@ from hd_cell_rl.reward_grid_search import (
     _load_episode_build_expression_context,
     _load_one_episode_artifact,
 )
+from preprocessing.ppo_eval_plots import save_overlay_plots, save_summary_plots
+from preprocessing.ppo_eval_metrics import (
+    build_episode_nuclear_barcode_map,
+    collect_gt_nuclear_candidates,
+    compute_spatial_overlap_metrics,
+    load_episode_build_bins_path,
+    load_gt_bins_for_cells,
+    match_episode_cells_by_nuclear_overlap,
+    normalize_cell_id,
+)
 
 logger = logging.getLogger(__name__)
 
 _LOCAL_TIMEZONE = ZoneInfo("America/Chicago")
 _LOCAL_TIMEZONE_NAME = "America/Chicago"
+
+
+def add_ppo_format_assignment_eval_args(
+    parser: Any,
+    *,
+    default_eval_run_name: str,
+    method_label: str,
+) -> None:
+    """Add the shared PPO-format evaluation CLI arguments used by method runners."""
+    parser.add_argument(
+        "--ppo_eval_run_dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional PPO evaluation run directory containing per_episode.csv and config_used.yaml. "
+            f"If provided, evaluate {method_label} on the same episode cell set."
+        ),
+    )
+    parser.add_argument(
+        "--eval_run_name",
+        type=str,
+        default=default_eval_run_name,
+        help=f"Run-name prefix for PPO-format {method_label} evaluation outputs.",
+    )
+    parser.add_argument(
+        "--eval_output_root",
+        type=str,
+        default="runs",
+        help=f"Root directory for PPO-format {method_label} evaluation outputs.",
+    )
+    parser.add_argument(
+        "--overlay_max_cells",
+        type=int,
+        default=300,
+        help="Maximum number of overlay PNGs to write for PPO-format evaluation.",
+    )
+    parser.add_argument(
+        "--overlay_selection",
+        type=str,
+        choices=("first", "random", "best_iou", "worst_iou"),
+        default="first",
+        help="How to choose per-cell overlays for PPO-format evaluation.",
+    )
+    parser.add_argument(
+        "--eval_seed",
+        type=int,
+        default=7,
+        help="Random seed for PPO-format evaluation overlay selection.",
+    )
+    parser.add_argument(
+        "--pred_min_nuclear_overlap_frac",
+        type=float,
+        default=0.3,
+        help=f"Minimum episode nuclear-bin fraction needed to accept a {method_label} prediction match.",
+    )
+    parser.add_argument(
+        "--pred_min_nuclear_overlap_bins",
+        type=int,
+        default=2,
+        help=f"Minimum overlapping nuclear bins needed to accept a {method_label} prediction match.",
+    )
+    parser.add_argument(
+        "--gt_cell_bins_path",
+        type=str,
+        default=None,
+        help="Optional GT full-cell bin table used for PPO-format IoU/Dice evaluation.",
+    )
+    parser.add_argument(
+        "--gt_nuclear_bins_path",
+        type=str,
+        default=None,
+        help="Optional GT nuclear-bin table used for PPO-format GT matching.",
+    )
+    parser.add_argument(
+        "--gt_cell_assignments_csv",
+        type=str,
+        default=None,
+        help="Optional pseudo-data cell_id to sc_cell_barcode mapping for gene correlation.",
+    )
+    parser.add_argument(
+        "--gt_sc_expression_h5",
+        type=str,
+        default=None,
+        help="Optional ground-truth single-cell expression H5 for gene correlation.",
+    )
+    parser.add_argument(
+        "--gt_min_nuclear_overlap_frac",
+        type=float,
+        default=0.3,
+        help="Minimum episode nuclear-bin fraction needed to accept a GT match.",
+    )
+    parser.add_argument(
+        "--gt_min_nuclear_overlap_bins",
+        type=int,
+        default=2,
+        help="Minimum overlapping nuclear bins needed to accept a GT match.",
+    )
+
+
+def validate_ppo_format_assignment_eval_args(args: Any) -> None:
+    """Validate shared PPO-format evaluation CLI arguments."""
+    if int(args.overlay_max_cells) < 0:
+        raise ValueError("--overlay_max_cells must be >= 0")
+    if not (0.0 <= float(args.pred_min_nuclear_overlap_frac) <= 1.0):
+        raise ValueError("--pred_min_nuclear_overlap_frac must be in [0, 1]")
+    if not (0.0 <= float(args.gt_min_nuclear_overlap_frac) <= 1.0):
+        raise ValueError("--gt_min_nuclear_overlap_frac must be in [0, 1]")
+    if int(args.pred_min_nuclear_overlap_bins) < 0:
+        raise ValueError("--pred_min_nuclear_overlap_bins must be >= 0")
+    if int(args.gt_min_nuclear_overlap_bins) < 0:
+        raise ValueError("--gt_min_nuclear_overlap_bins must be >= 0")
 
 
 def _decode_h5_strings(values: np.ndarray) -> list[str]:
@@ -255,33 +372,9 @@ class _TenXColumnExpressionReader:
         return out
 
 
-def _slug(value: str) -> str:
-    out = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(value)).strip("_")
-    return out or "cell"
-
-
 def _now_utc_and_local() -> tuple[dt.datetime, dt.datetime]:
     now_utc = dt.datetime.now(dt.timezone.utc)
     return now_utc, now_utc.astimezone(_LOCAL_TIMEZONE)
-
-
-def normalize_cell_id(value: Any) -> str | None:
-    if value is None or pd.isna(value):
-        return None
-    if isinstance(value, (np.integer, int)):
-        return str(int(value))
-    if isinstance(value, (np.floating, float)):
-        if not np.isfinite(value):
-            return None
-        if float(value).is_integer():
-            return str(int(value))
-        return str(value)
-    text = str(value).strip()
-    if not text:
-        return None
-    if re.fullmatch(r"[+-]?\d+\.0+", text):
-        return text.split(".", 1)[0]
-    return text
 
 
 def coerce_bool_series(series: pd.Series) -> pd.Series:
@@ -347,50 +440,6 @@ def load_eval_cell_ids(per_episode_csv: Path) -> list[str]:
         ordered.append(cell_id)
         seen.add(cell_id)
     return ordered
-
-
-def _load_episode_build_bins_path(episodes_index_path: Path) -> Path | None:
-    cfg_path = episodes_index_path.parent / "config" / "config_resolved.yaml"
-    if not cfg_path.exists():
-        return None
-    raw = _load_yaml_dict(cfg_path)
-    inputs = raw.get("inputs")
-    if not isinstance(inputs, dict):
-        return None
-    bins_value = inputs.get("bins_path")
-    if bins_value is None:
-        return None
-    return Path(str(bins_value)).expanduser().resolve()
-
-
-def _build_episode_nuclear_barcode_map(bins_path: Path, target_cell_ids: set[str]) -> dict[str, set[str]]:
-    if not bins_path.exists():
-        raise FileNotFoundError(f"episode-build bins metadata not found: {bins_path}")
-
-    df = pd.read_parquet(
-        bins_path,
-        columns=["barcode", "dominant_cell_id", "has_nuclear_annotation"],
-    )
-    df = df.loc[df["has_nuclear_annotation"].fillna(False).astype(bool)].copy()
-    dominant = pd.to_numeric(df["dominant_cell_id"], errors="coerce")
-    keep = dominant.notna()
-    if not np.any(keep.to_numpy(dtype=bool, copy=False)):
-        return {}
-
-    out_df = pd.DataFrame(
-        {
-            "cell_id": dominant.loc[keep].astype(np.int64).astype(str),
-            "barcode": df.loc[keep, "barcode"].astype(str),
-        }
-    )
-    out_df = out_df.loc[out_df["cell_id"].isin(target_cell_ids)].copy()
-    if out_df.empty:
-        return {}
-
-    mapping: dict[str, set[str]] = {}
-    for cell_id, group in out_df.groupby("cell_id", sort=False):
-        mapping[str(cell_id)] = set(group["barcode"].astype(str).tolist())
-    return mapping
 
 
 def load_episode_geometries(
@@ -505,34 +554,23 @@ def match_episode_cells_to_predictions(
     min_overlap_bins: int,
     pred_match_method: str,
 ) -> tuple[dict[str, dict[str, Any]], set[str]]:
-    provisional: dict[str, dict[str, Any]] = {}
-    matched_pred_ids: set[str] = set()
-    for cell_id, ep_nuclear in episode_nuclear_by_cell.items():
-        matched_pred_cell_id: str | None = None
-        overlap_count = 0
-        overlap_frac_episode = np.nan
-        match_method = "unmatched"
-        if ep_nuclear:
-            counts: Counter[str] = Counter()
-            for barcode in ep_nuclear:
-                for pred_cell_id in barcode_to_pred_cells.get(barcode, ()): 
-                    counts[str(pred_cell_id)] += 1
-            if counts:
-                best_pred_cell_id, best_count = max(counts.items(), key=lambda kv: (kv[1], kv[0]))
-                best_frac = float(best_count / len(ep_nuclear))
-                if int(best_count) >= int(min_overlap_bins) and best_frac >= float(min_overlap_frac):
-                    matched_pred_cell_id = str(best_pred_cell_id)
-                    overlap_count = int(best_count)
-                    overlap_frac_episode = best_frac
-                    match_method = pred_match_method
-                    matched_pred_ids.add(matched_pred_cell_id)
-        provisional[str(cell_id)] = {
-            "matched_pred_cell_id": matched_pred_cell_id,
-            "pred_match_method": match_method,
-            "pred_nuclear_overlap_bins": int(overlap_count),
-            "pred_nuclear_overlap_frac_episode": float(overlap_frac_episode),
+    raw, matched_ids = match_episode_cells_by_nuclear_overlap(
+        episode_nuclear_by_cell=episode_nuclear_by_cell,
+        barcode_to_target_cells=barcode_to_pred_cells,
+        min_overlap_frac=min_overlap_frac,
+        min_overlap_bins=min_overlap_bins,
+        match_method=pred_match_method,
+    )
+    converted = {
+        cell_id: {
+            "matched_pred_cell_id": meta.get("matched_cell_id"),
+            "pred_match_method": meta.get("match_method", "unmatched"),
+            "pred_nuclear_overlap_bins": int(meta.get("nuclear_overlap_bins", 0)),
+            "pred_nuclear_overlap_frac_episode": float(meta.get("nuclear_overlap_frac_episode", np.nan)),
         }
-    return provisional, matched_pred_ids
+        for cell_id, meta in raw.items()
+    }
+    return converted, matched_ids
 
 
 def load_assignment_barcodes_for_cells(assignments_csv: Path, matched_cell_ids: set[str]) -> dict[str, set[str]]:
@@ -552,63 +590,6 @@ def load_assignment_barcodes_for_cells(assignments_csv: Path, matched_cell_ids: 
     return dict(out)
 
 
-def _load_gt_bins_for_cells(
-    *,
-    csv_path: Path,
-    matched_cell_ids: set[str],
-) -> tuple[dict[str, set[str]], dict[str, np.ndarray]]:
-    if not matched_cell_ids:
-        return {}, {}
-
-    barcode_map: dict[str, list[str]] = defaultdict(list)
-    xy_x: dict[str, list[float]] = defaultdict(list)
-    xy_y: dict[str, list[float]] = defaultdict(list)
-    usecols = ["cell_id", "barcode", "x_um", "y_um"]
-    for chunk in pd.read_csv(csv_path, usecols=usecols, compression="infer", chunksize=1_000_000):
-        chunk = chunk.dropna(subset=["cell_id", "barcode", "x_um", "y_um"]).copy()
-        chunk["cell_id"] = chunk["cell_id"].map(normalize_cell_id)
-        chunk = chunk.loc[chunk["cell_id"].isin(matched_cell_ids)].copy()
-        if chunk.empty:
-            continue
-        chunk["barcode"] = chunk["barcode"].astype(str)
-        chunk["x_um"] = pd.to_numeric(chunk["x_um"], errors="coerce")
-        chunk["y_um"] = pd.to_numeric(chunk["y_um"], errors="coerce")
-        chunk = chunk.dropna(subset=["x_um", "y_um"])
-        if chunk.empty:
-            continue
-        for cell_id, group in chunk.groupby("cell_id", sort=False):
-            barcode_map[str(cell_id)].extend(group["barcode"].astype(str).tolist())
-            xy_x[str(cell_id)].extend(group["x_um"].astype(float).tolist())
-            xy_y[str(cell_id)].extend(group["y_um"].astype(float).tolist())
-
-    barcode_sets = {cell_id: set(values) for cell_id, values in barcode_map.items()}
-    xy_map = {
-        cell_id: np.column_stack((np.asarray(xy_x[cell_id], dtype=np.float32), np.asarray(xy_y[cell_id], dtype=np.float32)))
-        for cell_id in barcode_map
-    }
-    return barcode_sets, xy_map
-
-
-def _collect_gt_nuclear_candidates(
-    *,
-    gt_nuclear_bins_path: Path,
-    episode_nuclear_barcodes: set[str],
-) -> dict[str, set[str]]:
-    barcode_to_gt_cells: dict[str, set[str]] = defaultdict(set)
-    usecols = ["cell_id", "barcode"]
-    for chunk in pd.read_csv(gt_nuclear_bins_path, usecols=usecols, compression="infer", chunksize=1_000_000):
-        chunk = chunk.dropna(subset=["cell_id", "barcode"]).copy()
-        chunk["cell_id"] = chunk["cell_id"].map(normalize_cell_id)
-        chunk = chunk.loc[chunk["cell_id"].notna()].copy()
-        if chunk.empty:
-            continue
-        chunk["barcode"] = chunk["barcode"].astype(str)
-        overlap = chunk.loc[chunk["barcode"].isin(episode_nuclear_barcodes), ["barcode", "cell_id"]]
-        for barcode, group in overlap.groupby("barcode", sort=False):
-            barcode_to_gt_cells[str(barcode)].update(group["cell_id"].astype(str).tolist())
-    return dict(barcode_to_gt_cells)
-
-
 def annotate_records_with_ground_truth(
     *,
     records: list[PredictionEvalRecord],
@@ -621,16 +602,16 @@ def annotate_records_with_ground_truth(
     if not records:
         return records
 
-    bins_path = _load_episode_build_bins_path(episodes_index_path)
+    bins_path = load_episode_build_bins_path(episodes_index_path)
     if bins_path is None:
         raise FileNotFoundError(
             f"could not resolve episode-build bins_path from {episodes_index_path.parent / 'config' / 'config_resolved.yaml'}"
         )
 
     episode_cell_ids = {str(rec.metrics["cell_id"]) for rec in records}
-    episode_nuclear_by_cell = _build_episode_nuclear_barcode_map(bins_path=bins_path, target_cell_ids=episode_cell_ids)
+    episode_nuclear_by_cell = build_episode_nuclear_barcode_map(bins_path=bins_path, target_cell_ids=episode_cell_ids)
     episode_nuclear_union = set().union(*episode_nuclear_by_cell.values()) if episode_nuclear_by_cell else set()
-    barcode_to_gt_cells = _collect_gt_nuclear_candidates(
+    barcode_to_gt_cells = collect_gt_nuclear_candidates(
         gt_nuclear_bins_path=gt_nuclear_bins_path,
         episode_nuclear_barcodes=episode_nuclear_union,
     )
@@ -641,8 +622,8 @@ def annotate_records_with_ground_truth(
         min_overlap_bins=min_overlap_bins,
         pred_match_method="nuclear_overlap",
     )
-    gt_barcodes_by_cell, gt_xy_by_cell = _load_gt_bins_for_cells(csv_path=gt_cell_bins_path, matched_cell_ids=matched_gt_ids)
-    gt_nuclear_barcodes_by_cell, gt_nuclear_xy_by_cell = _load_gt_bins_for_cells(
+    gt_barcodes_by_cell, gt_xy_by_cell = load_gt_bins_for_cells(csv_path=gt_cell_bins_path, matched_cell_ids=matched_gt_ids)
+    gt_nuclear_barcodes_by_cell, gt_nuclear_xy_by_cell = load_gt_bins_for_cells(
         csv_path=gt_nuclear_bins_path,
         matched_cell_ids=matched_gt_ids,
     )
@@ -658,26 +639,7 @@ def annotate_records_with_ground_truth(
             if int(chosen) == 1
         }
         gt_barcodes = gt_barcodes_by_cell.get(str(matched_gt_cell_id), set()) if matched_gt_cell_id is not None else set()
-        intersection = 0
-        union = 0
-        pred_iou = np.nan
-        pred_dice = np.nan
-        pred_precision = np.nan
-        pred_recall = np.nan
-        pred_f1 = np.nan
-        if matched_gt_cell_id is not None:
-            intersection = len(assigned_barcodes & gt_barcodes)
-            union = len(assigned_barcodes | gt_barcodes)
-            pred_iou = float(intersection / union) if union > 0 else np.nan
-            denom = len(assigned_barcodes) + len(gt_barcodes)
-            pred_dice = float((2 * intersection) / denom) if denom > 0 else np.nan
-            pred_precision = float(intersection / len(assigned_barcodes)) if len(assigned_barcodes) > 0 else 0.0
-            pred_recall = float(intersection / len(gt_barcodes)) if len(gt_barcodes) > 0 else 0.0
-            pred_f1 = (
-                float((2 * pred_precision * pred_recall) / (pred_precision + pred_recall))
-                if (pred_precision + pred_recall) > 0
-                else 0.0
-            )
+        overlap = compute_spatial_overlap_metrics(assigned_barcodes, gt_barcodes) if matched_gt_cell_id is not None else None
         gt_cell_xy = gt_xy_by_cell.get(str(matched_gt_cell_id)) if matched_gt_cell_id is not None else None
         gt_nuclear_xy = gt_nuclear_xy_by_cell.get(str(matched_gt_cell_id)) if matched_gt_cell_id is not None else None
         updated.append(
@@ -689,40 +651,21 @@ def annotate_records_with_ground_truth(
                     "match_method": meta.get("pred_match_method", "unmatched"),
                     "gt_nuclear_overlap_bins": int(meta.get("pred_nuclear_overlap_bins", 0)),
                     "gt_nuclear_overlap_frac_episode": float(meta.get("pred_nuclear_overlap_frac_episode", np.nan)),
-                    "pred_iou": pred_iou,
-                    "pred_dice": pred_dice,
-                    "pred_precision": pred_precision,
-                    "pred_recall": pred_recall,
-                    "pred_f1": pred_f1,
-                    "gt_assigned_intersection": int(intersection),
-                    "gt_assigned_union": int(union),
-                    "pred_n_bins": int(len(assigned_barcodes)),
-                    "gt_n_bins": int(len(gt_barcodes)),
+                    "pred_iou": np.nan if overlap is None else overlap["iou"],
+                    "pred_dice": np.nan if overlap is None else overlap["dice"],
+                    "pred_precision": np.nan if overlap is None else overlap["precision"],
+                    "pred_recall": np.nan if overlap is None else overlap["recall"],
+                    "pred_f1": np.nan if overlap is None else overlap["f1"],
+                    "gt_assigned_intersection": 0 if overlap is None else int(overlap["intersection"]),
+                    "gt_assigned_union": 0 if overlap is None else int(overlap["union"]),
+                    "pred_n_bins": int(len(assigned_barcodes)) if overlap is None else int(overlap["pred_n_bins"]),
+                    "gt_n_bins": int(len(gt_barcodes)) if overlap is None else int(overlap["gt_n_bins"]),
                 },
                 gt_cell_xy_um=None if gt_cell_xy is None else np.asarray(gt_cell_xy, dtype=np.float32),
                 gt_nuclear_xy_um=None if gt_nuclear_xy is None else np.asarray(gt_nuclear_xy, dtype=np.float32),
             )
         )
     return updated
-
-
-def _choose_overlay_indices(df: pd.DataFrame, n_pick: int, selection: str, seed: int) -> list[int]:
-    if n_pick <= 0 or len(df) == 0:
-        return []
-    n_pick = min(int(n_pick), len(df))
-    if selection == "first":
-        return list(range(n_pick))
-    if selection == "best_iou" and "pred_iou" in df.columns:
-        scores = pd.to_numeric(df["pred_iou"], errors="coerce").fillna(-np.inf).to_numpy(dtype=np.float64)
-        order = np.argsort(-scores)
-        return [int(i) for i in order[:n_pick]]
-    if selection == "worst_iou" and "pred_iou" in df.columns:
-        scores = pd.to_numeric(df["pred_iou"], errors="coerce").fillna(np.inf).to_numpy(dtype=np.float64)
-        order = np.argsort(scores)
-        return [int(i) for i in order[:n_pick]]
-    rng = np.random.default_rng(int(seed))
-    choices = rng.choice(len(df), size=n_pick, replace=False)
-    return [int(i) for i in np.asarray(choices, dtype=np.int64)]
 
 
 def _add_numeric_summary(summary: dict[str, Any], df: pd.DataFrame, column: str, prefix: str = "") -> None:
@@ -736,245 +679,6 @@ def _add_numeric_summary(summary: dict[str, Any], df: pd.DataFrame, column: str,
     summary[f"mean_{key}"] = float(values.mean())
     summary[f"median_{key}"] = float(values.median())
     summary[f"n_valid_{key}"] = int(len(values))
-
-
-def _estimate_grid_step(coords: np.ndarray) -> float:
-    vals = np.unique(np.asarray(coords, dtype=np.float64))
-    if vals.size <= 1:
-        return 2.0
-    diffs = np.diff(np.sort(vals))
-    diffs = diffs[np.isfinite(diffs) & (diffs > 1.0e-6)]
-    if diffs.size == 0:
-        return 2.0
-    return float(np.median(diffs))
-
-
-def _build_gt_contour_grid(xy: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-    pts = np.asarray(xy, dtype=np.float64)
-    if pts.ndim != 2 or pts.shape[1] != 2 or pts.shape[0] == 0:
-        return None
-
-    step_x = _estimate_grid_step(pts[:, 0])
-    step_y = _estimate_grid_step(pts[:, 1])
-    x0 = float(np.min(pts[:, 0]))
-    y0 = float(np.min(pts[:, 1]))
-    ix = np.rint((pts[:, 0] - x0) / step_x).astype(np.int64)
-    iy = np.rint((pts[:, 1] - y0) / step_y).astype(np.int64)
-    if ix.size == 0 or iy.size == 0:
-        return None
-
-    min_ix = int(ix.min())
-    max_ix = int(ix.max())
-    min_iy = int(iy.min())
-    max_iy = int(iy.max())
-    width = max_ix - min_ix + 1
-    height = max_iy - min_iy + 1
-    if width <= 0 or height <= 0:
-        return None
-
-    grid = np.zeros((height + 2, width + 2), dtype=np.uint8)
-    gx = (ix - min_ix + 1).astype(np.int64, copy=False)
-    gy = (iy - min_iy + 1).astype(np.int64, copy=False)
-    grid[gy, gx] = 1
-    x_coords = x0 + ((np.arange(width + 2, dtype=np.float64) + min_ix - 1.0) * step_x)
-    y_coords = y0 + ((np.arange(height + 2, dtype=np.float64) + min_iy - 1.0) * step_y)
-    return x_coords, y_coords, grid
-
-
-def _finite_float_or_none(value: Any) -> float | None:
-    try:
-        val = float(value)
-    except (TypeError, ValueError):
-        return None
-    return val if np.isfinite(val) else None
-
-
-def _format_overlay_title(row: dict[str, Any], method_label: str) -> str:
-    lines = [
-        f"cell={row['cell_id']}  {method_label.lower()}={row.get('matched_pred_cell_id', 'unmatched')}  "
-        f"assigned={row['n_assigned_bins']}/{row['n_candidate_bins']}",
-        f"GT match={row.get('match_method', 'none')}",
-    ]
-
-    iou = _finite_float_or_none(row.get("pred_iou", np.nan))
-    dice = _finite_float_or_none(row.get("pred_dice", np.nan))
-    precision = _finite_float_or_none(row.get("pred_precision", np.nan))
-    recall = _finite_float_or_none(row.get("pred_recall", np.nan))
-    metric_parts: list[str] = []
-    if iou is not None:
-        metric_parts.append(f"IoU={iou:.3f}")
-    if dice is not None:
-        metric_parts.append(f"Dice={dice:.3f}")
-    if precision is not None:
-        metric_parts.append(f"P={precision:.3f}")
-    if recall is not None:
-        metric_parts.append(f"R={recall:.3f}")
-    if metric_parts:
-        lines.append("  ".join(metric_parts))
-
-    gene = _finite_float_or_none(row.get("gene_spearman_r", np.nan))
-    if gene is not None:
-        lines.append(f"Gene Spearman={gene:.3f}")
-    return "\n".join(lines)
-
-
-def save_summary_plots(df: pd.DataFrame, run_dir: Path, *, method_label: str) -> list[str]:
-    plots_dir = run_dir / "plots"
-    plots_dir.mkdir(parents=True, exist_ok=True)
-    saved: list[str] = []
-
-    fig, ax = plt.subplots(figsize=(7.5, 5.0))
-    ax.hist(df["n_assigned_bins"].to_numpy(dtype=np.float64), bins=40, color="#E76F51", alpha=0.9)
-    ax.set_title("Assigned Bins Distribution")
-    ax.set_xlabel("Assigned Bins")
-    ax.set_ylabel("Episode Count")
-    fig.tight_layout()
-    p = plots_dir / "assigned_bins_hist.png"
-    fig.savefig(p, dpi=180)
-    plt.close(fig)
-    saved.append(str(p))
-
-    if "pred_iou" in df.columns:
-        iou = pd.to_numeric(df["pred_iou"], errors="coerce").to_numpy(dtype=np.float64)
-        iou = iou[np.isfinite(iou)]
-        if iou.size > 0:
-            fig, ax = plt.subplots(figsize=(7.5, 5.0))
-            ax.hist(iou, bins=30, color="#457B9D", alpha=0.9)
-            ax.set_title(f"{method_label} vs GT IoU Distribution")
-            ax.set_xlabel("IoU")
-            ax.set_ylabel("Episode Count")
-            fig.tight_layout()
-            p = plots_dir / "pred_gt_iou_hist.png"
-            fig.savefig(p, dpi=180)
-            plt.close(fig)
-            saved.append(str(p))
-
-            fig, ax = plt.subplots(figsize=(7.5, 5.0))
-            iou_sorted = np.sort(iou)
-            cdf_y = np.arange(1, iou_sorted.size + 1, dtype=np.float64) / float(iou_sorted.size)
-            ax.plot(iou_sorted, cdf_y, color="#2A6F97", linewidth=2.0)
-            ax.set_title(f"{method_label} vs GT IoU CDF")
-            ax.set_xlabel("IoU")
-            ax.set_ylabel("Cumulative Fraction")
-            ax.set_xlim(0.0, 1.0)
-            ax.set_ylim(0.0, 1.0)
-            ax.grid(True, alpha=0.25, linewidth=0.6)
-            fig.tight_layout()
-            p = plots_dir / "pred_gt_iou_cdf.png"
-            fig.savefig(p, dpi=180)
-            plt.close(fig)
-            saved.append(str(p))
-
-    if "pred_dice" in df.columns:
-        dice = pd.to_numeric(df["pred_dice"], errors="coerce").to_numpy(dtype=np.float64)
-        dice = dice[np.isfinite(dice)]
-        if dice.size > 0:
-            fig, ax = plt.subplots(figsize=(7.5, 5.0))
-            ax.hist(dice, bins=30, color="#1D3557", alpha=0.9)
-            ax.set_title(f"{method_label} vs GT Dice Distribution")
-            ax.set_xlabel("Dice")
-            ax.set_ylabel("Episode Count")
-            fig.tight_layout()
-            p = plots_dir / "pred_gt_dice_hist.png"
-            fig.savefig(p, dpi=180)
-            plt.close(fig)
-            saved.append(str(p))
-
-    return saved
-
-
-def save_overlay_plots(
-    *,
-    records: list[PredictionEvalRecord],
-    df: pd.DataFrame,
-    run_dir: Path,
-    max_cells: int,
-    selection: str,
-    seed: int,
-    method_label: str,
-) -> list[str]:
-    if max_cells <= 0 or not records:
-        return []
-
-    overlays_dir = run_dir / "overlays"
-    overlays_dir.mkdir(parents=True, exist_ok=True)
-    indices = _choose_overlay_indices(df=df, n_pick=max_cells, selection=selection, seed=seed)
-    saved: list[str] = []
-    for idx in indices:
-        rec = records[idx]
-        row = rec.metrics
-        xy = np.asarray(rec.candidate_bin_xy_um, dtype=np.float32)
-        if xy.ndim != 2 or xy.shape[1] != 2 or xy.shape[0] == 0:
-            continue
-        assigned = np.asarray(rec.final_membership_mask, dtype=np.uint8) == 1
-        if assigned.shape[0] != xy.shape[0]:
-            continue
-
-        fig, ax = plt.subplots(figsize=(6.2, 6.2))
-        ax.scatter(
-            xy[:, 0],
-            xy[:, 1],
-            s=3,
-            c="#D0D4DB",
-            alpha=0.22,
-            linewidths=0.0,
-            zorder=1,
-            label="candidate bins",
-        )
-        gt_cell_xy = None if rec.gt_cell_xy_um is None else np.asarray(rec.gt_cell_xy_um, dtype=np.float32)
-        if gt_cell_xy is not None and gt_cell_xy.ndim == 2 and gt_cell_xy.shape[1] == 2 and gt_cell_xy.shape[0] > 0:
-            contour_grid = _build_gt_contour_grid(gt_cell_xy)
-            if contour_grid is not None:
-                x_coords, y_coords, grid = contour_grid
-                ax.contour(
-                    x_coords,
-                    y_coords,
-                    grid,
-                    levels=[0.5],
-                    colors=["#1D3557"],
-                    linewidths=3.0,
-                    alpha=1.0,
-                    zorder=4,
-                )
-                ax.plot([], [], color="#1D3557", linewidth=3.0, alpha=1.0, label="GT cell outline")
-        if np.any(assigned):
-            ax.scatter(
-                xy[assigned, 0],
-                xy[assigned, 1],
-                s=8,
-                c="#E63946",
-                alpha=0.95,
-                linewidths=0.0,
-                zorder=3,
-                label="assigned bins",
-            )
-
-        center = np.asarray(rec.nucleus_center_xy_um, dtype=np.float32)
-        if center.shape == (2,):
-            ax.scatter(
-                [float(center[0])],
-                [float(center[1])],
-                s=90,
-                marker="x",
-                c="#1D3557",
-                linewidths=2.0,
-                zorder=5,
-                label="nucleus center",
-            )
-
-        ax.set_aspect("equal", adjustable="box")
-        ax.set_xlabel("x (um)")
-        ax.set_ylabel("y (um)")
-        ax.set_title(_format_overlay_title(row, method_label), fontsize=10.5, pad=10)
-        ax.legend(loc="best", fontsize=8, frameon=False)
-        fig.tight_layout()
-
-        out = overlays_dir / f"overlay_{idx:04d}_{_slug(str(row['cell_id']))}.png"
-        fig.savefig(out, dpi=180, bbox_inches="tight")
-        plt.close(fig)
-        saved.append(str(out))
-
-    return saved
 
 
 def run_ppo_format_assignment_evaluation(
@@ -1015,12 +719,12 @@ def run_ppo_format_assignment_evaluation(
     if not target_cell_ids:
         raise RuntimeError("no overlapping episode cells were loaded for PPO-format assignment evaluation")
 
-    bins_path = _load_episode_build_bins_path(episodes_index_path)
+    bins_path = load_episode_build_bins_path(episodes_index_path)
     if bins_path is None:
         raise FileNotFoundError(
             f"could not resolve episode-build bins_path from {episodes_index_path.parent / 'config' / 'config_resolved.yaml'}"
         )
-    episode_nuclear_by_cell = _build_episode_nuclear_barcode_map(
+    episode_nuclear_by_cell = build_episode_nuclear_barcode_map(
         bins_path=bins_path,
         target_cell_ids=set(target_cell_ids),
     )

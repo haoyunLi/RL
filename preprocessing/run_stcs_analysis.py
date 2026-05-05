@@ -26,10 +26,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from preprocessing.ppo_format_assignment_eval import (
+    add_ppo_format_assignment_eval_args,
     coerce_bool_series,
     load_eval_cell_ids,
     normalize_cell_id,
     run_ppo_format_assignment_evaluation,
+    validate_ppo_format_assignment_eval_args,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,20 +57,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force_nuclear_assignments", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--restrict_to_eval_cells", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--eval_context_radius_bins", type=int, default=None)
-    parser.add_argument("--ppo_eval_run_dir", default=None, help="PPO eval run dir for same-cell evaluation.")
-    parser.add_argument("--eval_run_name", default="human_colorectal_stcs_eval", help="Evaluation run-name prefix.")
-    parser.add_argument("--eval_output_root", default="runs", help="Evaluation output root.")
-    parser.add_argument("--overlay_max_cells", type=int, default=300)
-    parser.add_argument("--overlay_selection", choices=("first", "random", "best_iou", "worst_iou"), default="first")
-    parser.add_argument("--eval_seed", type=int, default=7)
-    parser.add_argument("--pred_min_nuclear_overlap_frac", type=float, default=0.3)
-    parser.add_argument("--pred_min_nuclear_overlap_bins", type=int, default=2)
-    parser.add_argument("--gt_cell_bins_path", default=None)
-    parser.add_argument("--gt_nuclear_bins_path", default=None)
-    parser.add_argument("--gt_cell_assignments_csv", default=None)
-    parser.add_argument("--gt_sc_expression_h5", default=None)
-    parser.add_argument("--gt_min_nuclear_overlap_frac", type=float, default=0.3)
-    parser.add_argument("--gt_min_nuclear_overlap_bins", type=int, default=2)
+    add_ppo_format_assignment_eval_args(
+        parser,
+        default_eval_run_name="human_colorectal_stcs_eval",
+        method_label="STCS",
+    )
     return parser.parse_args()
 
 
@@ -459,12 +452,7 @@ def _save_assignments(
 
 def main() -> None:
     args = parse_args()
-    if args.overlay_max_cells < 0:
-        raise ValueError("--overlay_max_cells must be >= 0")
-    if not (0.0 <= args.pred_min_nuclear_overlap_frac <= 1.0):
-        raise ValueError("--pred_min_nuclear_overlap_frac must be in [0, 1]")
-    if not (0.0 <= args.gt_min_nuclear_overlap_frac <= 1.0):
-        raise ValueError("--gt_min_nuclear_overlap_frac must be in [0, 1]")
+    validate_ppo_format_assignment_eval_args(args)
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     _configure_logging(output_dir)

@@ -52,9 +52,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from preprocessing.ppo_format_assignment_eval import (
+    add_ppo_format_assignment_eval_args,
     coerce_bool_series,
     normalize_cell_id,
     run_ppo_format_assignment_evaluation,
+    validate_ppo_format_assignment_eval_args,
 )
 
 # Configure logging
@@ -147,104 +149,10 @@ def parse_args():
         help='Gaussian filter sigma for GEX image smoothing (default: 5.0, higher=smoother)'
     )
 
-    parser.add_argument(
-        '--ppo_eval_run_dir',
-        type=str,
-        default=None,
-        help='Optional PPO evaluation run directory containing per_episode.csv and config_used.yaml. '
-             'If provided, evaluate bin2cell on the exact same episode cell set.'
-    )
-
-    parser.add_argument(
-        '--eval_run_name',
-        type=str,
-        default='human_colorectal_bin2cell_eval',
-        help='Run-name prefix for PPO-format bin2cell evaluation outputs'
-    )
-
-    parser.add_argument(
-        '--eval_output_root',
-        type=str,
-        default='runs',
-        help='Root directory for PPO-format bin2cell evaluation outputs'
-    )
-
-    parser.add_argument(
-        '--overlay_max_cells',
-        type=int,
-        default=300,
-        help='Number of overlay PNGs to write for PPO-format bin2cell evaluation'
-    )
-
-    parser.add_argument(
-        '--overlay_selection',
-        type=str,
-        choices=('first', 'random', 'best_iou', 'worst_iou'),
-        default='first',
-        help='How to choose per-cell overlays for PPO-format bin2cell evaluation'
-    )
-
-    parser.add_argument(
-        '--eval_seed',
-        type=int,
-        default=7,
-        help='Seed for PPO-format bin2cell evaluation overlay selection'
-    )
-
-    parser.add_argument(
-        '--pred_min_nuclear_overlap_frac',
-        type=float,
-        default=0.3,
-        help='Minimum fraction of PPO episode nuclear bins needed to accept a bin2cell match'
-    )
-
-    parser.add_argument(
-        '--pred_min_nuclear_overlap_bins',
-        type=int,
-        default=2,
-        help='Minimum number of overlapping nuclear bins needed to accept a bin2cell match'
-    )
-
-    parser.add_argument(
-        '--gt_cell_bins_path',
-        type=str,
-        default=None,
-        help='Optional GT full-cell bin table used for PPO-format IoU/Dice evaluation'
-    )
-
-    parser.add_argument(
-        '--gt_nuclear_bins_path',
-        type=str,
-        default=None,
-        help='Optional GT nuclear-bin table used for PPO-format GT matching'
-    )
-
-    parser.add_argument(
-        '--gt_cell_assignments_csv',
-        type=str,
-        default=None,
-        help='Optional pseudo-data cell_id to sc_cell_barcode mapping for gene correlation'
-    )
-
-    parser.add_argument(
-        '--gt_sc_expression_h5',
-        type=str,
-        default=None,
-        help='Optional ground-truth single-cell expression H5 for gene correlation'
-    )
-
-    parser.add_argument(
-        '--gt_min_nuclear_overlap_frac',
-        type=float,
-        default=0.3,
-        help='Minimum fraction of PPO episode nuclear bins needed to accept a GT match'
-    )
-
-    parser.add_argument(
-        '--gt_min_nuclear_overlap_bins',
-        type=int,
-        default=2,
-        help='Minimum number of overlapping nuclear bins needed to accept a GT match'
+    add_ppo_format_assignment_eval_args(
+        parser,
+        default_eval_run_name='human_colorectal_bin2cell_eval',
+        method_label='bin2cell',
     )
 
     parser.add_argument(
@@ -1069,16 +977,7 @@ def save_results(adata, cdata, output_dir, dataset_name):
 def main():
     """Main function."""
     args = parse_args()
-    if args.overlay_max_cells < 0:
-        raise ValueError('--overlay_max_cells must be >= 0')
-    if args.pred_min_nuclear_overlap_frac < 0 or args.pred_min_nuclear_overlap_frac > 1:
-        raise ValueError('--pred_min_nuclear_overlap_frac must be in [0, 1]')
-    if args.gt_min_nuclear_overlap_frac < 0 or args.gt_min_nuclear_overlap_frac > 1:
-        raise ValueError('--gt_min_nuclear_overlap_frac must be in [0, 1]')
-    if args.pred_min_nuclear_overlap_bins < 0:
-        raise ValueError('--pred_min_nuclear_overlap_bins must be >= 0')
-    if args.gt_min_nuclear_overlap_bins < 0:
-        raise ValueError('--gt_min_nuclear_overlap_bins must be >= 0')
+    validate_ppo_format_assignment_eval_args(args)
 
     logger.info("="*80)
     logger.info("Starting bin2cell analysis")

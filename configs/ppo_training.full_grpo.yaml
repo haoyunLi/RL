@@ -49,19 +49,39 @@ group_relative:
   norm_epsilon: 1.0e-6
   score: episode_total_reward
 
+planner:
+  enabled: true
+  interval: 4
+  modes: [stop, compact, balanced, explore]
+  cot_weight: 0.4
+  entropy_coef: 0.02
+  logit_bias:
+    compact:
+      neighbor_support: 0.8
+      compactness_gain: 0.5
+      centroid_distance: -0.3
+      expression: 0.2
+    balanced:
+      neighbor_support: 0.2
+      compactness_gain: 0.1
+      centroid_distance: -0.1
+      expression: 0.2
+    explore:
+      neighbor_support: 0.0
+      compactness_gain: 0.0
+      centroid_distance: -0.1
+      expression: 0.5
+
 full_grpo:
   reward_weight: 1.0
-  size_weight: 0.8
-  stop_weight: 0.4
-  compact_weight: 0.2
-  small_over_weight: 1.2
-  large_under_weight: 1.2
-  small_seed_max: 8
-  large_seed_min: 17
-  targets:
-    small: [1.4, 2.4]
-    medium: [1.6, 2.8]
-    large: [1.8, 3.4]
+  evidence_growth_weight: 0.7
+  stop_weight: 0.5
+  overgrowth_weight: 0.8
+  compact_weight: 0.25
+  compact_streak_weight: 0.25
+  explore_weight: 0.4
+  tau_frontier: 0.0
+  frontier_temp: 0.2
 
 reward:
   epsilon: 1.0e-8

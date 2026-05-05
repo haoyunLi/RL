@@ -12,8 +12,9 @@ import numpy as np
 import pandas as pd
 import torch
 
+from hd_cell_rl.ppo_checkpoint import load_actor_critic_checkpoint
+from hd_cell_rl.ppo_model import ActorCritic
 from hd_cell_rl.ppo_training import (
-    ActorCritic,
     AddStopCellEnv,
     EpisodeDataset,
     EpisodeContext,
@@ -29,6 +30,12 @@ from hd_cell_rl.ppo_training import (
     _load_table,
     load_ppo_training_config,
 )
+from hd_cell_rl.ppo_feature_schema import (
+    ADD_ACTION_FEATURE_LABELS,
+    ACTION_FEATURE_NAMES,
+    GLOBAL_FEATURE_NAMES,
+    STOP_ACTION_FEATURE_LABELS,
+)
 from hd_cell_rl.reward_grid_search import (
     _load_legacy_episode_artifact_payload,
     _load_sharded_episode_artifact_payload,
@@ -38,104 +45,6 @@ from hd_cell_rl.reward import (
     compute_frontier_eligible_mask,
     compute_neighbor_support_fraction,
     compute_stop_delta,
-)
-
-
-GLOBAL_FEATURE_NAMES: tuple[str, ...] = (
-    "assigned_frac",
-    "step_frac",
-    "n_bins_scaled",
-    "assigned_ll_mean",
-    "assigned_ll_max",
-    "remaining_frac",
-    "seed_size_scaled",
-    "grow_ratio_scaled",
-    "positive_frontier_fraction",
-    "centroid_drift_scaled",
-    "compactness_proxy",
-    "frontier_add_reward_topk_mean",
-    "frontier_add_reward_mean",
-    "frontier_add_reward_std",
-    "frontier_add_reward_max",
-    "seed_compactness",
-    "seed_radius_p90_scaled",
-    "seed_aspect_ratio_scaled",
-)
-
-_ACTION_FEATURE_TAIL: tuple[str, ...] = (
-    "candidate_to_current_centroid_distance",
-    "candidate_compactness_gain",
-    "dx_from_nucleus_scaled",
-    "dy_from_nucleus_scaled",
-    "dx_from_current_centroid_scaled",
-    "dy_from_current_centroid_scaled",
-    "radial_alignment_with_centroid_drift",
-    "candidate_add_reward_total",
-    "candidate_expr_term",
-    "candidate_base_penalty",
-    "candidate_neighbor_support",
-    "candidate_expression_confidence",
-    "candidate_count_scaled",
-    "frontier_add_reward_topk_mean",
-    "frontier_add_reward_mean",
-    "frontier_add_reward_std",
-    "frontier_add_reward_max",
-    "seed_compactness",
-    "seed_radius_p90_scaled",
-    "seed_aspect_ratio_scaled",
-    "ll_margin_z",
-    "ll_entropy_scaled",
-    "candidate_seed_neighbor_support",
-    "candidate_dist_to_seed_centroid_scaled",
-    "candidate_expr_raw",
-    "candidate_expr_weighted",
-    "candidate_distance_penalty",
-    "candidate_overlap_penalty",
-)
-
-ACTION_FEATURE_NAMES: tuple[str, ...] = (
-    "is_stop_action",
-    "col1",
-    "col2",
-    "col3",
-    "col4",
-    "col5",
-    "col6",
-    "col7",
-    "col8",
-    "col9",
-    "col10",
-    *_ACTION_FEATURE_TAIL,
-)
-
-STOP_ACTION_FEATURE_LABELS: tuple[str, ...] = (
-    "is_stop_action",
-    "assigned_frac",
-    "step_frac",
-    "n_bins_scaled",
-    "assigned_ll_mean",
-    "remaining_frac",
-    "seed_size_scaled",
-    "grow_ratio_scaled",
-    "positive_frontier_fraction",
-    "centroid_drift_scaled",
-    "compactness_proxy",
-    *_ACTION_FEATURE_TAIL,
-)
-
-ADD_ACTION_FEATURE_LABELS: tuple[str, ...] = (
-    "is_stop_action",
-    "ll_mean_z",
-    "ll_max_z",
-    "p_dis",
-    "p_overlap",
-    "is_assigned",
-    "seed_size_scaled_or_zero",
-    "grow_ratio_scaled_or_zero",
-    "positive_frontier_fraction_or_zero",
-    "centroid_drift_scaled_or_zero",
-    "compactness_proxy_or_zero",
-    *_ACTION_FEATURE_TAIL,
 )
 
 
@@ -506,18 +415,12 @@ class PPODebugSession:
             checkpoint_path=checkpoint_path,
         )
         config = load_ppo_training_config(debug_summary.config_path)
-        payload = torch.load(debug_summary.checkpoint_path, map_location="cpu")
-        if not isinstance(payload, dict) or "model_state_dict" not in payload:
-            raise ValueError(f"invalid checkpoint payload in {debug_summary.checkpoint_path}")
-
         resolved_device = _resolve_device(str(device_name))
-        model = ActorCritic(
-            global_dim=AddStopCellEnv.GLOBAL_FEATURE_DIM,
-            action_dim=AddStopCellEnv.ACTION_FEATURE_DIM,
-            hidden_dim=int(config.hidden_dim),
-        ).to(resolved_device)
-        model.load_state_dict(payload["model_state_dict"])
-        model.eval()
+        model, _ = load_actor_critic_checkpoint(
+            debug_summary.checkpoint_path,
+            config,
+            device=resolved_device,
+        )
 
         rng = np.random.default_rng(int(config.seed or 0))
         dataset = EpisodeDataset(config=config, rng=rng)
@@ -803,10 +706,6 @@ class PPODebugSession:
             membership_mask=membership_mask,
             step_index=step_index,
         )
-        if action_features.shape[1] > 30:
-            state_summary["seed_compactness"] = float(action_features[0, 28])
-            state_summary["seed_radius_p90_scaled"] = float(action_features[0, 29])
-            state_summary["seed_aspect_ratio_scaled"] = float(action_features[0, 30])
         stop_delta = float(
             compute_stop_delta(
                 add_rewards,

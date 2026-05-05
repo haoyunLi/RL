@@ -27,8 +27,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from preprocessing.ppo_format_assignment_eval import (
+    add_ppo_format_assignment_eval_args,
     coerce_bool_series,
     run_ppo_format_assignment_evaluation,
+    validate_ppo_format_assignment_eval_args,
 )
 
 
@@ -419,36 +421,13 @@ def main():
                        help='Microns per pixel conversion factor')
     parser.add_argument('--external_nuclear_bins_path', type=str, default=None,
                        help='Optional PPO-aligned nuclear-bin CSV/CSV.GZ. If provided, skip SMURF H&E nuclei segmentation.')
-    parser.add_argument('--ppo_eval_run_dir', type=str, default=None,
-                       help='Optional PPO evaluation run directory containing per_episode.csv and config_used.yaml.')
-    parser.add_argument('--eval_run_name', type=str, default='human_colorectal_smurf_eval',
-                       help='Prefix for PPO-format SMURF evaluation run directory.')
-    parser.add_argument('--eval_output_root', type=str, default='runs',
-                       help='Root directory where PPO-format SMURF evaluation runs are written.')
-    parser.add_argument('--overlay_max_cells', type=int, default=300,
-                       help='Maximum number of overlay plots to save for PPO-format evaluation.')
-    parser.add_argument('--overlay_selection', type=str, default='first',
-                       choices=['first', 'random', 'best_iou', 'worst_iou'],
-                       help='Which evaluated cells to use for overlays.')
-    parser.add_argument('--eval_seed', type=int, default=7,
-                       help='Random seed for overlay selection when using random mode.')
-    parser.add_argument('--pred_min_nuclear_overlap_frac', type=float, default=0.3,
-                       help='Minimum nuclear overlap fraction required to match a PPO episode cell to a SMURF prediction.')
-    parser.add_argument('--pred_min_nuclear_overlap_bins', type=int, default=2,
-                       help='Minimum overlapping nuclear bins required to match a PPO episode cell to a SMURF prediction.')
-    parser.add_argument('--gt_cell_bins_path', type=str, default=None,
-                       help='Optional GT all-bin CSV/CSV.GZ for PPO-format evaluation.')
-    parser.add_argument('--gt_nuclear_bins_path', type=str, default=None,
-                       help='Optional GT nuclear-bin CSV/CSV.GZ for PPO-format evaluation.')
-    parser.add_argument('--gt_cell_assignments_csv', type=str, default=None,
-                       help='Optional pseudo-data cell_id to sc_cell_barcode mapping for gene correlation.')
-    parser.add_argument('--gt_sc_expression_h5', type=str, default=None,
-                       help='Optional ground-truth single-cell expression H5 for gene correlation.')
-    parser.add_argument('--gt_min_nuclear_overlap_frac', type=float, default=0.3,
-                       help='Minimum nuclear overlap fraction required when matching GT cells.')
-    parser.add_argument('--gt_min_nuclear_overlap_bins', type=int, default=2,
-                       help='Minimum nuclear overlap bins required when matching GT cells.')
+    add_ppo_format_assignment_eval_args(
+        parser,
+        default_eval_run_name='human_colorectal_smurf_eval',
+        method_label='SMURF',
+    )
     args = parser.parse_args()
+    validate_ppo_format_assignment_eval_args(args)
 
     save_path = Path(args.output_dir).expanduser().resolve()
     pseudo_hd_dir = args.pseudo_hd_dir
